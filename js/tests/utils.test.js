@@ -133,6 +133,18 @@ describe('utils.js', () => {
         });
     });
 
+    describe('createQualityBadgeHTML', () => {
+        test('adds a YouTube badge for fallback streams', () => {
+            const html = utils.createQualityBadgeHTML({
+                audioQuality: 'HI_RES_LOSSLESS',
+                isYoutubeFallbackStream: true,
+            });
+
+            expect(html).toContain('HD');
+            expect(html).toContain('YT');
+        });
+    });
+
     describe('getTrackTitle', () => {
         test('returns title with version if present', () => {
             expect(utils.getTrackTitle({ title: 'Song', version: 'Remix' })).toBe('Song (Remix)');

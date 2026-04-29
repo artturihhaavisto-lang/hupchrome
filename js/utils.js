@@ -291,13 +291,19 @@ export const normalizeQualityToken = (value) => {
 export const createQualityBadgeHTML = (track) => {
     if (!qualityBadgeSettings.isEnabled()) return '';
 
+    const badges = [];
     const quality = deriveTrackQuality(track);
     if (quality === 'DOLBY_ATMOS') {
-        return `<span class="quality-badge quality-atmos" title="Dolby Atmos">${SVG_ATMOS(20)}</span>`;
+        badges.push(`<span class="quality-badge quality-atmos" title="Dolby Atmos">${SVG_ATMOS(20)}</span>`);
     } else if (quality === 'HI_RES_LOSSLESS') {
-        return '<span class="quality-badge quality-hires" title="Hi-Res Lossless">HD</span>';
+        badges.push('<span class="quality-badge quality-hires" title="Hi-Res Lossless">HD</span>');
     }
-    return '';
+
+    if (track?.isYoutubeFallbackStream) {
+        badges.push('<span class="quality-badge quality-youtube" title="Streaming from YouTube Music">YT</span>');
+    }
+
+    return badges.join('');
 };
 
 export const deriveQualityFromTags = (rawTags) => {

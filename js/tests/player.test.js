@@ -28,6 +28,8 @@ vi.mock('../storage.js', () => ({
         setPreservePitch: vi.fn(),
     },
     radioSettings: { isEnabled: vi.fn(() => false) },
+    autoplaySettings: { isEnabled: vi.fn(() => false) },
+    binauralDspSettings: { getAutoEnableForSpatial: vi.fn(() => false), isEnabled: vi.fn(() => false) },
     contentBlockingSettings: {
         shouldHideTrack: vi.fn(() => false),
         shouldHideAlbum: vi.fn(() => false),
@@ -114,6 +116,7 @@ describe('Player', () => {
             getCoverUrl: vi.fn((id) => `url-${id}`),
             getCoverSrcset: vi.fn(),
             getStreamUrl: vi.fn(),
+            getVideoArtwork: vi.fn(() => Promise.resolve(null)),
         };
 
         Player._instance = null;
@@ -191,5 +194,38 @@ describe('Player', () => {
 
         player.setPlaybackSpeed(0);
         expect(audioEffectsSettings.setSpeed).toHaveBeenCalledWith(0.01);
+    });
+
+    test('renders resolved stream quality details in the now playing title', () => {
+        player = new Player(audioElement, api);
+
+        player.updateNowPlayingTitle({
+            id: 'track-1',
+            title: 'One More Time',
+            streamInfo: {
+                url: 'https://streaming-qobuz-std.akamaized.net/file?uid=1',
+                format: 'flac',
+                quality: 'hires-192',
+                estimatedBitrateKbps: 1012,
+                source: 'qobuz',
+            },
+        });
+
+        const badge = document.querySelector('.stream-quality-badge');
+        expect(badge).not.toBeNull();
+        expect(badge.textContent).toContain('FLAC');
+        expect(badge.textContent).toContain('Hi-Res');
+        expect(badge.textContent).toContain('192 kHz');
+        expect(badge.textContent).toContain('1012 kbps');
+        expect(badge.title).toContain('qobuz');
+    });
+
+    test('treats expiring preloaded stream URLs as stale', () => {
+        player = new Player(audioElement, api);
+        const now = Date.now() / 1000;
+
+        expect(player.isStreamInfoFresh({ url: 'https://example.com/audio.flac' })).toBe(true);
+        expect(player.isStreamInfoFresh({ url: 'https://example.com/audio.flac', expiresAt: now + 120 })).toBe(true);
+        expect(player.isStreamInfoFresh({ url: 'https://example.com/audio.flac', expiresAt: now + 10 })).toBe(false);
     });
 });

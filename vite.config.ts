@@ -11,6 +11,20 @@ import { execSync } from 'child_process';
 import purgecss from 'vite-plugin-purgecss';
 
 function proxyAudioPlugin() {
+    function isAllowedProxyTarget(target: string) {
+        try {
+            const url = new URL(target);
+            return (
+                (url.hostname === 'spotiflac.eclipsemusic.app' && url.pathname.startsWith('/ab6e65dc54c4adf8/')) ||
+                url.hostname === 'eclipse3.cyrusna29.workers.dev' ||
+                url.hostname === 'spotiflac-eclipse.cyrusna29.workers.dev' ||
+                url.hostname === 'all-in-one.cyrusna29.workers.dev'
+            );
+        } catch {
+            return false;
+        }
+    }
+
     return {
         name: 'proxy-audio-dev',
         configureServer(server) {
@@ -18,7 +32,7 @@ function proxyAudioPlugin() {
                 try {
                     const requestUrl = new URL(req.url || '', 'http://localhost');
                     const target = requestUrl.searchParams.get('url');
-                    if (!target || !/^https:\/\/all-in-one\.cyrusna29\.workers\.dev\//.test(target)) {
+                    if (!target || !isAllowedProxyTarget(target)) {
                         res.statusCode = 400;
                         res.end('Invalid proxy target');
                         return;

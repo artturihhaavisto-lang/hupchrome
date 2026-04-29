@@ -215,6 +215,29 @@ export class MusicAPI {
         return api.getStreamUrl(cleanId, quality);
     }
 
+    async getPlayableStreamInfo(trackOrId, quality, options = {}) {
+        const api = this.getAPI();
+        if (typeof api.getPlayableStreamInfo === 'function') {
+            if (typeof trackOrId === 'object' && trackOrId) {
+                return api.getPlayableStreamInfo(
+                    {
+                        ...trackOrId,
+                        id: this.stripProviderPrefix(trackOrId.id),
+                    },
+                    quality,
+                    options
+                );
+            }
+            return api.getPlayableStreamInfo(this.stripProviderPrefix(trackOrId), quality, options);
+        }
+
+        const cleanId =
+            typeof trackOrId === 'object' && trackOrId
+                ? this.stripProviderPrefix(trackOrId.id)
+                : this.stripProviderPrefix(trackOrId);
+        return api.getStreamUrl(cleanId, quality);
+    }
+
     // Cover/artwork methods
     getCoverUrl(id, size = '320') {
         if (typeof id === 'string' && id.startsWith('blob:')) {
@@ -368,6 +391,12 @@ export class MusicAPI {
     // Cache methods
     async clearCache() {
         await this.tidalAPI.clearCache();
+    }
+
+    invalidateStreamCache(id = null) {
+        if (typeof this.tidalAPI.invalidateStreamCache === 'function') {
+            this.tidalAPI.invalidateStreamCache(this.stripProviderPrefix(id));
+        }
     }
 
     getCacheStats() {

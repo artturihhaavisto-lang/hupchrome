@@ -19,6 +19,7 @@ import {
     autoplaySettings,
     binauralDspSettings,
     contentBlockingSettings,
+    qualityBadgeSettings,
 } from './storage.js';
 import { audioContextManager } from './audio-context.js';
 import { isIos, isSafari } from './platform-detection.js';
@@ -55,7 +56,10 @@ export class Player {
         this.blobPlaybackUrls = new Map();
         this.retiredBlobPlaybackUrls = new Map();
         this._pendingPreload = false;
-        setInterval(this.checkPreloadConditions.bind(this), 2000);
+        this._boundCheckPreloadConditions = this.checkPreloadConditions.bind(this);
+        setInterval(() => {
+            void this.checkPreloadConditions();
+        }, 2000);
         this.preloadAbortController = null;
         this.currentTrack = null;
         this.currentRgValues = null;
@@ -63,6 +67,9 @@ export class Player {
         this.isFallbackRetry = false;
         this.isFallbackInProgress = false;
         this.autoplayBlocked = false;
+        this._recentlyPlayedIds = [];
+        this._maxRecentlyPlayed = 100;
+        this.playbackSequence = 0;
         this.isIOS = isIos;
         this.isPwa =
             typeof window !== 'undefined' &&
@@ -80,6 +87,11 @@ export class Player {
             initialTracks: [],
             isFetching: false,
             hasMore: true,
+        };
+        this.playbackLoadState = {
+            visible: false,
+            percent: null,
+            label: '',
         };
     }
 
@@ -99,10 +111,16 @@ export class Player {
         this.audio.addEventListener('canplay', () => {
             this.applyAudioEffects();
         });
+        this.audio.addEventListener('timeupdate', this._boundCheckPreloadConditions);
+        this.audio.addEventListener('durationchange', this._boundCheckPreloadConditions);
+        this._bindPlaybackLoadEvents(this.audio);
         if (this.video) {
             this.video.addEventListener('canplay', () => {
                 this.applyAudioEffects();
             });
+            this.video.addEventListener('timeupdate', this._boundCheckPreloadConditions);
+            this.video.addEventListener('durationchange', this._boundCheckPreloadConditions);
+            this._bindPlaybackLoadEvents(this.video);
         }
 
         const waitForImagesLoading = () => {
@@ -150,7 +168,12 @@ export class Player {
                 if (type === shaka.net.NetworkingEngine.RequestType.SEGMENT) {
                     const uris = request.uris;
                     for (let i = 0; i < uris.length; i++) {
-                        if (uris[i].includes('tidal.com')) {
+                        if (
+                            uris[i].includes('tidal.com') &&
+                            !uris[i].includes('.manifest.tidal.com/') &&
+                            !uris[i].includes('.audio.tidal.com/') &&
+                            !uris[i].includes('.audio.tidalhifi.com/')
+                        ) {
                             uris[i] = getProxyUrl(uris[i]);
                         }
                     }
@@ -339,6 +362,276 @@ export class Player {
         this.applyAudioEffects();
     }
 
+    _bindPlaybackLoadEvents(element) {
+        const updateBufferedProgress = () => {
+            if (!this.currentTrack) return;
+            if (!this.playbackLoadState.visible) return;
+            if (element.paused && element.readyState >= 2 && element.currentTime > 0) return;
+
+            const duration = Number.isFinite(element.duration) ? element.duration : 0;
+            const bufferedEnd = element.buffered?.length ? element.buffered.end(element.buffered.length - 1) : 0;
+            if (duration > 0 && bufferedEnd > 0) {
+                const percent = Math.max(0, Math.min(100, (bufferedEnd / duration) * 100));
+                this.showPlaybackLoadProgress(percent, percent >= 100 ? 'Ready' : `Buffering ${Math.round(percent)}%`);
+            } else if (element.readyState < 2) {
+                this.showPlaybackLoadIndeterminate('Buffering...');
+            }
+        };
+
+        element.addEventListener('loadstart', () => this.showPlaybackLoadIndeterminate('Connecting...'));
+        element.addEventListener('progress', updateBufferedProgress);
+        element.addEventListener('loadedmetadata', updateBufferedProgress);
+        element.addEventListener('canplay', () => this.hidePlaybackLoadProgress());
+        element.addEventListener('waiting', () => this.showPlaybackLoadIndeterminate('Buffering...'));
+        element.addEventListener('playing', () => this.hidePlaybackLoadProgress());
+        element.addEventListener('canplaythrough', () => this.hidePlaybackLoadProgress());
+        element.addEventListener('error', () => this.hidePlaybackLoadProgress());
+    }
+
+    updatePlaybackLoadIndicator({ visible, percent = null, label = '', indeterminate = false }) {
+        this.playbackLoadState = { visible, percent, label };
+        const root = document.getElementById('playback-load-indicator');
+        const fill = document.getElementById('playback-load-fill');
+        const text = document.getElementById('playback-load-label');
+        if (!root || !fill || !text) return;
+
+        root.classList.toggle('visible', visible);
+        root.classList.toggle('indeterminate', visible && indeterminate);
+        fill.style.width = visible && percent != null ? `${Math.max(0, Math.min(100, percent))}%` : '0%';
+        text.textContent = label || 'Loading...';
+    }
+
+    showPlaybackLoadProgress(percent, label = 'Loading...') {
+        this.updatePlaybackLoadIndicator({
+            visible: true,
+            percent,
+            label,
+            indeterminate: false,
+        });
+    }
+
+    showPlaybackLoadIndeterminate(label = 'Loading...') {
+        this.updatePlaybackLoadIndicator({
+            visible: true,
+            percent: null,
+            label,
+            indeterminate: true,
+        });
+    }
+
+    hidePlaybackLoadProgress() {
+        this.updatePlaybackLoadIndicator({
+            visible: false,
+            percent: null,
+            label: '',
+            indeterminate: false,
+        });
+    }
+
+    async fetchBlobWithProgress(url, { signal, label = 'Downloading...', onProgress } = {}) {
+        const directUrl = url;
+        let response = await fetch(directUrl, { signal });
+        if (
+            !response.ok &&
+            response.status === 403 &&
+            typeof directUrl === 'string' &&
+            (directUrl.includes('amz-pr-fa.audio.tidal.com') || directUrl.includes('.audio.tidal.com'))
+        ) {
+            response = await fetch(getProxyUrl(directUrl), { signal });
+        }
+        if (!response.ok) {
+            throw new Error(`Failed to fetch stream: HTTP ${response.status}`);
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json') || contentType.includes('text/json')) {
+            const payload = await response.json();
+            const nextUrl =
+                payload?.url ||
+                payload?.streamUrl ||
+                payload?.originalTrackUrl ||
+                payload?.OriginalTrackUrl ||
+                payload?.data?.url ||
+                payload?.data?.streamUrl ||
+                payload?.data?.originalTrackUrl ||
+                payload?.data?.OriginalTrackUrl;
+
+            if (!nextUrl || nextUrl === url) {
+                throw new Error('Stream endpoint returned JSON without a playable URL');
+            }
+
+            return this.fetchBlobWithProgress(nextUrl, { signal, label, onProgress });
+        }
+
+        const totalBytes = Number.parseInt(response.headers.get('content-length') || '0', 10) || 0;
+        const reader = response.body?.getReader?.();
+        if (!reader) {
+            const blob = await response.blob();
+            if (onProgress) onProgress({ loadedBytes: blob.size, totalBytes: blob.size, percent: 100 });
+            return blob;
+        }
+
+        const chunks = [];
+        let loadedBytes = 0;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (signal?.aborted) {
+                throw new DOMException('Aborted', 'AbortError');
+            }
+            chunks.push(value);
+            loadedBytes += value.byteLength;
+            const percent = totalBytes > 0 ? (loadedBytes / totalBytes) * 100 : null;
+            if (onProgress) onProgress({ loadedBytes, totalBytes, percent, label });
+        }
+
+        return new Blob(chunks);
+    }
+
+    async fallbackToBlobPlayback(streamUrl, track, activeElement, startTime = 0) {
+        const blob = await this.fetchBlobWithProgress(streamUrl, {
+            label: 'Downloading...',
+            onProgress: ({ percent }) => {
+                if (percent == null) {
+                    this.showPlaybackLoadIndeterminate('Downloading...');
+                } else {
+                    this.showPlaybackLoadProgress(percent, `Downloading ${Math.round(percent)}%`);
+                }
+            },
+        });
+
+        const blobUrl = URL.createObjectURL(blob);
+        this.blobPlaybackUrls.set(track.id, blobUrl);
+        activeElement.src = blobUrl;
+        this.applyAudioEffects();
+
+        if (startTime > 0) {
+            activeElement.currentTime = startTime;
+        }
+
+        const canPlay = await this.waitForCanPlayOrTimeout(activeElement);
+        if (!canPlay) return false;
+
+        const played = await this.safePlay(activeElement);
+        if (played) this.hidePlaybackLoadProgress();
+        return played;
+    }
+
+    updateNowPlayingTitle(track) {
+        const titleEl = document.querySelector('.now-playing-bar .title');
+        if (!titleEl) return;
+
+        titleEl.innerHTML = `${escapeHtml(getTrackTitle(track))} ${createQualityBadgeHTML(track)} ${this.createStreamQualityBadgeHTML(track)}`;
+    }
+
+    createStreamQualityBadgeHTML(track) {
+        if (!qualityBadgeSettings.isEnabled()) return '';
+
+        const streamInfo = track?.streamInfo || track?.currentStreamInfo;
+        if (!streamInfo) return '';
+
+        const parts = [];
+        const format = this.formatStreamToken(streamInfo.format || this.inferFormatFromUrl(streamInfo.url));
+        const quality = this.formatStreamQuality(streamInfo.quality || streamInfo.audioQuality);
+        const sampleRate = this.formatSampleRate(streamInfo.sampleRate || streamInfo.sampleRateHz, streamInfo.quality);
+        const bitrate = this.formatBitrate(
+            streamInfo.bitrate || streamInfo.bitrateKbps || streamInfo.estimatedBitrateKbps
+        );
+
+        if (format) parts.push(format);
+        if (quality && !parts.some((part) => part.toLowerCase() === quality.toLowerCase())) parts.push(quality);
+        if (sampleRate) parts.push(sampleRate);
+        if (bitrate) parts.push(bitrate);
+
+        if (parts.length === 0) return '';
+
+        const source =
+            streamInfo.source || streamInfo.manifestSourceId || streamInfo.fallbackSource || track?.manifestSourceId;
+        const detail = source ? `${parts.join(' • ')} via ${source}` : parts.join(' • ');
+        return `<span class="quality-badge stream-quality-badge" title="${escapeHtml(detail)}">${escapeHtml(parts.join(' · '))}</span>`;
+    }
+
+    formatStreamToken(value) {
+        const token = String(value || '').trim();
+        if (!token) return '';
+        const normalized = token.toLowerCase();
+        if (normalized === 'flac') return 'FLAC';
+        if (normalized === 'aac' || normalized === 'm4a' || normalized === 'mp4a') return 'AAC';
+        if (normalized === 'mp3') return 'MP3';
+        if (normalized === 'opus') return 'Opus';
+        return token.toUpperCase();
+    }
+
+    formatStreamQuality(value) {
+        const token = String(value || '').trim();
+        if (!token) return '';
+        const normalized = token.toLowerCase().replace(/[_-]+/g, ' ');
+        if (normalized.includes('hires') || normalized.includes('hi res')) return 'Hi-Res';
+        if (normalized.includes('lossless')) return 'Lossless';
+        if (normalized.includes('high')) return 'High';
+        if (normalized.includes('low')) return 'Low';
+        return token;
+    }
+
+    formatSampleRate(sampleRate, quality) {
+        const explicitRate = Number(sampleRate);
+        if (Number.isFinite(explicitRate) && explicitRate > 0) {
+            return `${explicitRate >= 1000 ? Math.round(explicitRate / 1000) : explicitRate} kHz`;
+        }
+
+        const match = String(quality || '').match(/(?:hires|hi-res)[-_ ]?(\d{2,3})/i);
+        return match ? `${match[1]} kHz` : '';
+    }
+
+    formatBitrate(value) {
+        const bitrate = Number(value);
+        if (!Number.isFinite(bitrate) || bitrate <= 0) return '';
+        return `${Math.round(bitrate)} kbps`;
+    }
+
+    inferFormatFromUrl(url) {
+        if (typeof url !== 'string') return '';
+        const cleanUrl = url.split('?')[0].toLowerCase();
+        if (cleanUrl.endsWith('.flac') || cleanUrl.includes('qobuz')) return 'flac';
+        if (cleanUrl.endsWith('.mp3')) return 'mp3';
+        if (cleanUrl.endsWith('.m4a') || cleanUrl.endsWith('.mp4') || cleanUrl.includes('tidal')) return 'aac';
+        return '';
+    }
+
+    attachStreamInfoToTrack(track, streamInfo, currentSequence) {
+        if (!track || !streamInfo) return;
+
+        track.streamInfo = streamInfo;
+        track.currentStreamInfo = streamInfo;
+        this.updateNowPlayingTitle(track);
+        void this.enrichStreamInfoForBadge(track, streamInfo, currentSequence);
+    }
+
+    async enrichStreamInfoForBadge(track, streamInfo, currentSequence) {
+        if (!streamInfo?.url || streamInfo.estimatedBitrateKbps || !track?.duration) return;
+        if (!/^https?:\/\//i.test(streamInfo.url)) return;
+
+        try {
+            const response = await fetch(streamInfo.url, { method: 'HEAD' });
+            if (!response.ok) return;
+
+            const contentLength = Number.parseInt(response.headers.get('content-length') || '0', 10);
+            if (contentLength > 0) {
+                streamInfo.contentLength = contentLength;
+                streamInfo.estimatedBitrateKbps = Math.round((contentLength * 8) / Math.max(1, track.duration) / 1000);
+            }
+            const contentType = response.headers.get('content-type');
+            if (contentType) streamInfo.contentType = contentType;
+
+            if (this.playbackSequence === currentSequence && this.currentTrack?.id === track.id) {
+                this.updateNowPlayingTitle(track);
+            }
+        } catch {
+            // Badge enrichment is cosmetic; playback should never depend on it.
+        }
+    }
+
     loadQueueState() {
         const savedState = queueManager.getQueue();
         if (savedState) {
@@ -361,7 +654,6 @@ export class Player {
                 const yearDisplay = getTrackYearDisplay(track);
 
                 const coverEl = document.querySelector('.now-playing-bar .cover');
-                const titleEl = document.querySelector('.now-playing-bar .title');
                 const albumEl = document.querySelector('.now-playing-bar .album');
                 const artistEl = document.querySelector('.now-playing-bar .artist');
 
@@ -408,10 +700,7 @@ export class Player {
                         }
                     }
                 }
-                if (titleEl) {
-                    const qualityBadge = createQualityBadgeHTML(track);
-                    titleEl.innerHTML = `${escapeHtml(trackTitle)} ${qualityBadge}`;
-                }
+                this.updateNowPlayingTitle(track);
                 if (albumEl) {
                     const albumTitle = track.album?.title || '';
                     if (albumTitle && albumTitle !== trackTitle) {
@@ -551,6 +840,23 @@ export class Player {
         }
     }
 
+    isStreamInfoFresh(streamInfo) {
+        if (!streamInfo?.expiresAt) return true;
+        return streamInfo.expiresAt > Date.now() / 1000 + 30;
+    }
+
+    async resolveFreshStreamInfo(track, quality = this.quality) {
+        this.releasePreloadEntry(track.id);
+        if (typeof this.api.invalidateStreamCache === 'function') {
+            this.api.invalidateStreamCache(track.id);
+        }
+
+        const streamInfo = await this.api.getPlayableStreamInfo(track, quality);
+        streamInfo.refreshedAt = Date.now();
+        this.preloadCache.set(track.id, streamInfo);
+        return streamInfo;
+    }
+
     releasePreloadEntry(trackId) {
         const entry = this.preloadCache.get(trackId);
         if (entry?.preloader) {
@@ -604,9 +910,8 @@ export class Player {
         const currentTime = this.activeElement.currentTime || 0;
         const duration = this.activeElement.duration || 0;
         const timeRemaining = duration - currentTime;
-
-        // Preload if we are in last 30 seconds of song
-        const shouldPreload = duration > 0 && timeRemaining <= 30;
+        const preloadLeadTime = duration > 0 ? Math.min(45, Math.max(12, duration * 0.15)) : 0;
+        const shouldPreload = duration > 0 && timeRemaining <= preloadLeadTime;
 
         if (shouldPreload) {
             this._pendingPreload = false;
@@ -640,9 +945,11 @@ export class Player {
                 const streamInfo =
                     track.type == 'video'
                         ? await this.api.getVideoStreamUrl(track.id)
-                        : await this.api.getStreamUrl(track.id, this.quality);
+                        : await this.api.getPlayableStreamInfo(track, this.quality);
 
                 if (this.preloadAbortController.signal.aborted) break;
+
+                streamInfo.preloadedAt = Date.now();
 
                 if (streamInfo.forceBlobPlayback && streamInfo.url && !streamInfo.url.startsWith('blob:')) {
                     const response = await fetch(streamInfo.url, { signal: this.preloadAbortController.signal });
@@ -732,7 +1039,9 @@ export class Player {
                         const preloader = new Audio();
                         preloader.preload = 'auto';
                         preloader.muted = true;
+                        preloader.crossOrigin = 'anonymous';
                         preloader.src = getProxyUrl(streamUrl);
+                        preloader.load();
                         streamInfo.preloader = preloader; // Hold reference
                     }
                 }
@@ -801,13 +1110,17 @@ export class Player {
         const streamUrl = streamInfo?.url;
         const canReuseAudioElement = previousActiveElement === this.audio && activeElement === this.audio;
 
-        if (!canReuseAudioElement || !streamUrl) {
+        if (!canReuseAudioElement || !streamUrl || !this.isStreamInfoFresh(streamInfo)) {
+            if (streamInfo && !this.isStreamInfoFresh(streamInfo)) {
+                this.releasePreloadEntry(track.id);
+            }
             return false;
         }
 
         if (streamInfo.blobPlayback) {
             this.blobPlaybackUrls.set(track.id, streamUrl);
         }
+        this.attachStreamInfoToTrack(track, streamInfo, currentSequence);
 
         const requiresShaka = !track.isLocal && (streamUrl.startsWith('blob:') || streamUrl.includes('.mpd'));
         if (requiresShaka && (!this.shakaPlayer || this.shakaPlayer.getMediaElement() !== activeElement)) {
@@ -1076,12 +1389,14 @@ export class Player {
 
         const track = currentQueue[this.currentQueueIndex];
         if (track.isUnavailable) {
+            this.hidePlaybackLoadProgress();
             console.warn(`Attempted to play unavailable track: ${track.title}. Skipping...`);
             await this.playNext();
             return;
         }
 
         if (contentBlockingSettings.shouldHideTrack(track)) {
+            this.hidePlaybackLoadProgress();
             console.warn(`Attempted to play blocked track: ${track.title}. Skipping...`);
             await this.playNext();
             return;
@@ -1118,6 +1433,8 @@ export class Player {
         }
 
         this.currentTrack = track;
+        track.isYoutubeFallbackStream = false;
+        this.showPlaybackLoadIndeterminate('Loading...');
         this.retireCurrentBlobPlaybackUrl(previousTrackId);
         this.addToRecentlyPlayed(track.id);
         const trackTitle = getTrackTitle(track);
@@ -1240,8 +1557,7 @@ export class Player {
                 }
             }
         }
-        document.querySelector('.now-playing-bar .title').innerHTML =
-            `${escapeHtml(trackTitle)} ${createQualityBadgeHTML(track)}`;
+        this.updateNowPlayingTitle(track);
         const albumEl = document.querySelector('.now-playing-bar .album');
         if (albumEl) {
             const albumTitle = track.album?.title || '';
@@ -1301,6 +1617,7 @@ export class Player {
                     activeElement.currentTime = startTime;
                 }
                 const played = await this.safePlay(activeElement);
+                if (played) this.hidePlaybackLoadProgress();
                 if (!played) return;
             } else if (isTracker || (track.audioUrl && !track.isLocal)) {
                 streamUrl = track.audioUrl;
@@ -1321,11 +1638,17 @@ export class Player {
 
                 if (isTracker && !streamUrl.startsWith('blob:') && streamUrl.startsWith('http')) {
                     try {
-                        const response = await fetch(streamUrl);
-                        if (response.ok) {
-                            const blob = await response.blob();
-                            streamUrl = URL.createObjectURL(blob);
-                        }
+                        const blob = await this.fetchBlobWithProgress(streamUrl, {
+                            label: 'Downloading...',
+                            onProgress: ({ percent }) => {
+                                if (percent == null) {
+                                    this.showPlaybackLoadIndeterminate('Downloading...');
+                                } else {
+                                    this.showPlaybackLoadProgress(percent, `Downloading ${Math.round(percent)}%`);
+                                }
+                            },
+                        });
+                        streamUrl = URL.createObjectURL(blob);
                     } catch (e) {
                         console.warn('Failed to fetch tracker blob, trying direct link', e);
                     }
@@ -1347,6 +1670,7 @@ export class Player {
                     activeElement.currentTime = startTime;
                 }
                 const played = await this.safePlay(activeElement);
+                if (played) this.hidePlaybackLoadProgress();
                 if (!played) return;
             } else if (track.isLocal && track.file) {
                 streamUrl = URL.createObjectURL(track.file);
@@ -1366,6 +1690,7 @@ export class Player {
                     activeElement.currentTime = startTime;
                 }
                 const played = await this.safePlay(activeElement);
+                if (played) this.hidePlaybackLoadProgress();
                 if (!played) return;
             } else if (track.type === 'video') {
                 if (UIRenderer.instance) {
@@ -1419,7 +1744,8 @@ export class Player {
                     activeElement.currentTime = startTime;
                 }
 
-                await this.safePlay(activeElement);
+                const played = await this.safePlay(activeElement);
+                if (played) this.hidePlaybackLoadProgress();
             } else {
                 if (
                     shouldPreserveGestureToken &&
@@ -1436,25 +1762,39 @@ export class Player {
                 }
 
                 // Tidal: Try to get ReplayGain from manifest first, supplement with track info if needed
-                const streamInfoPromise = this.preloadCache.has(track.id)
-                    ? Promise.resolve(this.preloadCache.get(track.id))
-                    : this.api.getStreamUrl(track.id, this.quality);
+                const preloadedStreamInfo = this.preloadCache.get(track.id);
+                if (preloadedStreamInfo && !this.isStreamInfoFresh(preloadedStreamInfo)) {
+                    this.releasePreloadEntry(track.id);
+                }
+                const streamInfoPromise =
+                    preloadedStreamInfo && this.isStreamInfoFresh(preloadedStreamInfo)
+                        ? Promise.resolve(preloadedStreamInfo)
+                        : this.api.getPlayableStreamInfo(track, this.quality);
 
                 // We only need the legacy track info if we missed getting ReplayGain from the manifest endpoint
                 const resolvedStreamInfo = await streamInfoPromise;
                 if (this.playbackSequence !== currentSequence) return;
 
                 streamUrl = resolvedStreamInfo.url;
+                track.isYoutubeFallbackStream = !!resolvedStreamInfo.isYoutubeFallback;
+                this.attachStreamInfoToTrack(track, resolvedStreamInfo, currentSequence);
                 if (resolvedStreamInfo.blobPlayback && streamUrl?.startsWith('blob:')) {
                     this.blobPlaybackUrls.set(track.id, streamUrl);
                 }
                 if (resolvedStreamInfo.forceBlobPlayback && streamUrl && !streamUrl.startsWith('blob:')) {
-                    const response = await fetch(streamUrl);
-                    if (!response.ok) {
-                        throw new Error(`Failed to load FLAC stream: HTTP ${response.status}`);
-                    }
-                    const blob = await response.blob();
+                    const blob = await this.fetchBlobWithProgress(streamUrl, {
+                        label: 'Downloading...',
+                        onProgress: ({ percent }) => {
+                            if (percent == null) {
+                                this.showPlaybackLoadIndeterminate('Downloading...');
+                            } else {
+                                this.showPlaybackLoadProgress(percent, `Downloading ${Math.round(percent)}%`);
+                            }
+                        },
+                    });
                     streamUrl = URL.createObjectURL(blob);
+                    resolvedStreamInfo.blobPlayback = true;
+                    resolvedStreamInfo.forceBlobPlayback = false;
                     this.blobPlaybackUrls.set(track.id, streamUrl);
                 }
 
@@ -1485,7 +1825,11 @@ export class Player {
                 if (this.playbackSequence !== currentSequence) return;
 
                 // Handle playback
-                if (streamUrl && (streamUrl.startsWith('blob:') || streamUrl.includes('.mpd')) && !track.isLocal) {
+                const requiresShakaPlayback =
+                    !track.isLocal &&
+                    (streamUrl.includes('.mpd') || (streamUrl.startsWith('blob:') && !resolvedStreamInfo.blobPlayback));
+
+                if (streamUrl && requiresShakaPlayback) {
                     // It's likely a DASH manifest URL
                     if (this.shakaPlayer.getMediaElement() !== activeElement) {
                         await this.shakaPlayer.attach(activeElement);
@@ -1516,7 +1860,8 @@ export class Player {
 
                     // Instantly trigger playback rather than explicitly waiting for 'canplay'
                     // which delays the event loop and natively adds gap/latency
-                    await this.safePlay(activeElement);
+                    const played = await this.safePlay(activeElement);
+                    if (played) this.hidePlaybackLoadProgress();
                 } else {
                     if (this.shakaInitialized) {
                         try {
@@ -1532,7 +1877,51 @@ export class Player {
                     if (startTime > 0) {
                         activeElement.currentTime = startTime;
                     }
+                    let canPlay = await this.waitForCanPlayOrTimeout(activeElement).catch(() => false);
+                    if ((!canPlay || activeElement.error) && this.playbackSequence === currentSequence) {
+                        try {
+                            const freshStreamInfo = await this.resolveFreshStreamInfo(track, this.quality);
+                            if (this.playbackSequence !== currentSequence) return;
+                            streamUrl = freshStreamInfo.url;
+                            this.attachStreamInfoToTrack(track, freshStreamInfo, currentSequence);
+                            activeElement.removeAttribute('src');
+                            activeElement.load();
+                            activeElement.src = getProxyUrl(streamUrl);
+                            if (startTime > 0) {
+                                activeElement.currentTime = startTime;
+                            }
+                            canPlay = await this.waitForCanPlayOrTimeout(activeElement).catch(() => false);
+                        } catch (refreshError) {
+                            console.warn('Failed to refresh stream URL after playback load failure:', refreshError);
+                        }
+                    }
+                    if ((!canPlay || activeElement.error) && this.playbackSequence === currentSequence) {
+                        const playedFromBlob = await this.fallbackToBlobPlayback(
+                            streamUrl,
+                            track,
+                            activeElement,
+                            startTime
+                        );
+                        if (!playedFromBlob || this.playbackSequence !== currentSequence) return;
+                        this.preloadNextTracks();
+                        this.cleanupRetiredBlobPlaybackUrls();
+                        return;
+                    }
+                    if (this.playbackSequence !== currentSequence) return;
                     const played = await this.safePlay(activeElement);
+                    if (!played && this.playbackSequence === currentSequence) {
+                        const playedFromBlob = await this.fallbackToBlobPlayback(
+                            streamUrl,
+                            track,
+                            activeElement,
+                            startTime
+                        );
+                        if (!playedFromBlob || this.playbackSequence !== currentSequence) return;
+                        this.preloadNextTracks();
+                        this.cleanupRetiredBlobPlaybackUrls();
+                        return;
+                    }
+                    if (played) this.hidePlaybackLoadProgress();
                     if (!played) return;
                 }
             }
@@ -1566,6 +1955,7 @@ export class Player {
             }
 
             console.error(`Could not play track: ${trackTitle}`, error);
+            this.hidePlaybackLoadProgress();
         }
     }
 

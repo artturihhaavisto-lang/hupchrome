@@ -4,9 +4,7 @@ import { SVG_RIGHT_ARROW } from './icons';
 
 export const apiSettings = {
     STORAGE_KEY: 'monochrome-api-instances-v9',
-    INSTANCES_URLS: [
-        'https://tidal-uptime.geeked.wtf',
-    ],
+    INSTANCES_URLS: ['https://tidal-uptime.geeked.wtf'],
     defaultInstances: { api: [], streaming: [] },
     userInstances: null,
     instancesLoaded: false,
@@ -3043,22 +3041,37 @@ export const musicSourceSettings = {
             baseUrl: null,
         },
         {
+            id: 'youtube-music',
+            name: 'YouTube Music',
+            manifestUrl: null,
+            baseUrl: null,
+        },
+        {
             id: 'spotiflac',
             name: 'SpotiFLAC',
-            manifestUrl: 'https://spotiflac.eclipsemusic.app/678b78ad3dde26ab/manifest.json',
-            baseUrl: 'https://spotiflac.eclipsemusic.app/678b78ad3dde26ab',
+            manifestUrl: 'https://spotiflac.eclipsemusic.app/ab6e65dc54c4adf8/manifest.json',
+            baseUrl: 'https://spotiflac.eclipsemusic.app/ab6e65dc54c4adf8',
+            proxyRequests: true,
+        },
+        {
+            id: 'soundcloud',
+            name: 'SoundCloud',
+            manifestUrl: 'https://eclipse3.cyrusna29.workers.dev/manifest.json',
+            baseUrl: 'https://eclipse3.cyrusna29.workers.dev',
+            proxyRequests: true,
         },
         {
             id: 'claudiflac',
-            name: 'ClaudiFLAC',
+            name: 'Deezer / TIDAL',
             manifestUrl: 'https://spotiflac-eclipse.cyrusna29.workers.dev/manifest.json',
             baseUrl: 'https://spotiflac-eclipse.cyrusna29.workers.dev',
+            proxyRequests: true,
         },
         {
-            id: 'all-in-one-lossless',
-            name: 'All In One (Lossless)',
-            manifestUrl: 'https://all-in-one.cyrusna29.workers.dev/eyJxIjoiTE9TU0xFU1MifQ/manifest.json',
-            baseUrl: 'https://all-in-one.cyrusna29.workers.dev/eyJxIjoiTE9TU0xFU1MifQ',
+            id: 'all-in-one',
+            name: 'All In One',
+            manifestUrl: 'https://all-in-one.cyrusna29.workers.dev/manifest.json',
+            baseUrl: 'https://all-in-one.cyrusna29.workers.dev',
             proxyRequests: true,
         },
     ],
@@ -3066,6 +3079,7 @@ export const musicSourceSettings = {
     getSource() {
         try {
             const source = localStorage.getItem(this.STORAGE_KEY) || this.DEFAULT_SOURCE;
+            if (source === 'all-in-one-lossless') return 'all-in-one';
             return this.SOURCES.some((s) => s.id === source) ? source : this.DEFAULT_SOURCE;
         } catch {
             return this.DEFAULT_SOURCE;

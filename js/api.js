@@ -8,7 +8,7 @@ import {
     getTrackDiscNumber,
     normalizeQualityToken,
 } from './utils.js';
-import { preferDolbyAtmosSettings, trackDateSettings, devModeSettings } from './storage.js';
+import { preferDolbyAtmosSettings, trackDateSettings, devModeSettings, musicSourceSettings } from './storage.js';
 import { APICache } from './cache.js';
 import { DashDownloader } from './dash-downloader.ts';
 import { HlsDownloader } from './hls-downloader.js';
@@ -52,6 +52,183 @@ export class LosslessAPI {
             },
             1000 * 60 * 5
         );
+    }
+
+    getSelectedMusicSource() {
+        return musicSourceSettings.getSourceConfig();
+    }
+
+    isManifestMusicSource() {
+        return this.getSelectedMusicSource()?.id !== musicSourceSettings.DEFAULT_SOURCE;
+    }
+
+    buildManifestSourceUrl(path) {
+        const source = this.getSelectedMusicSource();
+        if (!source?.baseUrl) {
+            throw new Error('No manifest music source configured');
+        }
+        return `${source.baseUrl.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
+    }
+
+    buildManifestSourceFetchUrl(path) {
+        const url = this.buildManifestSourceUrl(path);
+        const source = this.getSelectedMusicSource();
+        if (!source?.proxyRequests) {
+            return url;
+        }
+        return `/proxy-json?url=${encodeURIComponent(url)}`;
+    }
+
+    normalizeManifestArtist(artist, fallbackId = null) {
+        if (!artist) return null;
+        if (typeof artist === 'string') {
+            return {
+                id: fallbackId || artist,
+                name: artist,
+                picture: null,
+                type: 'artist',
+            };
+        }
+        return {
+            id: artist.id || fallbackId || artist.name,
+            name: artist.name || artist.title || String(fallbackId || ''),
+            picture: artist.picture || artist.image || artist.artworkURL || artist.cover || null,
+            type: 'artist',
+            ...artist,
+        };
+    }
+
+    normalizeManifestTrack(track) {
+        const artist = this.normalizeManifestArtist(track.artist || track.artistName || track.artists?.[0]);
+        const albumTitle = typeof track.album === 'string' ? track.album : track.album?.title || track.albumTitle || '';
+        const cover =
+            track.artworkURL || track.cover || track.image || track.album?.cover || track.album?.artworkURL || null;
+
+        return {
+            ...track,
+            id: track.id,
+            title: track.title || track.name || 'Unknown Track',
+            type: 'track',
+            duration: track.duration || 0,
+            artist,
+            artists:
+                track.artists?.map((a, i) => this.normalizeManifestArtist(a, `${track.id}-artist-${i}`)) ||
+                (artist ? [artist] : []),
+            album: {
+                id: track.albumId || track.album?.id || null,
+                title: albumTitle,
+                cover,
+            },
+            audioQuality: track.format === 'flac' ? 'LOSSLESS' : track.audioQuality || 'HIGH',
+            allowStreaming: true,
+            isrc: track.isrc || '',
+        };
+    }
+
+    normalizeManifestAlbum(album) {
+        const artist = this.normalizeManifestArtist(album.artist || album.artistName || album.artists?.[0]);
+        const cover = album.artworkURL || album.cover || album.image || null;
+        return {
+            ...album,
+            id: album.id,
+            title: album.title || album.name || 'Unknown Album',
+            cover,
+            image: cover,
+            artist,
+            artists:
+                album.artists?.map((a, i) => this.normalizeManifestArtist(a, `${album.id}-artist-${i}`)) ||
+                (artist ? [artist] : []),
+            numberOfTracks: album.trackCount || album.numberOfTracks || 0,
+            releaseDate: album.year ? String(album.year) : album.releaseDate,
+        };
+    }
+
+    normalizeManifestSearchSection(items = []) {
+        return {
+            items,
+            limit: items.length,
+            offset: 0,
+            totalNumberOfItems: items.length,
+        };
+    }
+
+    async searchManifestSource(query, options = {}) {
+        const response = await fetch(this.buildManifestSourceFetchUrl(`/search?q=${encodeURIComponent(query)}`), {
+            signal: options.signal,
+        });
+        if (!response.ok) {
+            throw new Error(`Manifest source search failed: HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const tracks = (data.tracks || []).map((t) => this.prepareTrack(this.normalizeManifestTrack(t)));
+        const albums = this.deduplicateAlbums(
+            (data.albums || []).map((a) => this.prepareAlbum(this.normalizeManifestAlbum(a)))
+        );
+        const artists = (data.artists || []).map((a) => this.prepareArtist(this.normalizeManifestArtist(a)));
+        const playlists = (data.playlists || []).map((p) =>
+            this.preparePlaylist({
+                ...p,
+                name: p.name || p.title,
+                title: p.title || p.name,
+                cover: p.artworkURL || p.cover || p.image,
+                squareImage: p.artworkURL || p.cover || p.image,
+                numberOfTracks: p.trackCount || p.numberOfTracks || 0,
+            })
+        );
+
+        return {
+            tracks: this.normalizeManifestSearchSection(tracks),
+            videos: this.normalizeManifestSearchSection([]),
+            artists: this.normalizeManifestSearchSection(artists),
+            albums: this.normalizeManifestSearchSection(albums),
+            playlists: this.normalizeManifestSearchSection(playlists),
+        };
+    }
+
+    async getManifestSourceStreamUrl(id, options = {}) {
+        const candidates = [
+            `/stream/${encodeURIComponent(id)}.json`,
+            `/stream/${encodeURIComponent(id)}`,
+            `/stream?id=${encodeURIComponent(id)}`,
+        ];
+
+        let lastError = null;
+        for (const path of candidates) {
+            try {
+                const response = await fetch(this.buildManifestSourceFetchUrl(path), { signal: options.signal });
+                if (!response.ok) {
+                    lastError = new Error(`HTTP ${response.status}`);
+                    continue;
+                }
+
+                const data = await response.json();
+                const url =
+                    data.url ||
+                    data.streamUrl ||
+                    data.originalTrackUrl ||
+                    data.OriginalTrackUrl ||
+                    data.streams?.[0]?.url ||
+                    data.sources?.[0]?.url;
+                if (url) {
+                    return {
+                        url,
+                        forceBlobPlayback: url.includes('streaming-qobuz-std.akamaized.net'),
+                        rgInfo: {
+                            trackReplayGain: null,
+                            trackPeakAmplitude: null,
+                            albumReplayGain: null,
+                            albumPeakAmplitude: null,
+                        },
+                    };
+                }
+            } catch (error) {
+                if (error.name === 'AbortError') throw error;
+                lastError = error;
+            }
+        }
+
+        throw lastError || new Error(`Could not resolve manifest source stream URL for ID: ${id}`);
     }
 
     pruneStreamCache() {
@@ -500,6 +677,10 @@ export class LosslessAPI {
     }
 
     async search(query, options = {}) {
+        if (this.isManifestMusicSource()) {
+            return this.searchManifestSource(query, options);
+        }
+
         const cached = await this.cache.get('search_all', query);
         if (cached) return cached;
 
@@ -568,6 +749,10 @@ export class LosslessAPI {
     }
 
     async searchTracks(query, options = {}) {
+        if (this.isManifestMusicSource()) {
+            return (await this.searchManifestSource(query, options)).tracks;
+        }
+
         const cached = await this.cache.get('search_tracks', query);
         if (cached) return cached;
 
@@ -595,6 +780,10 @@ export class LosslessAPI {
     }
 
     async searchArtists(query, options = {}) {
+        if (this.isManifestMusicSource()) {
+            return (await this.searchManifestSource(query, options)).artists;
+        }
+
         const cached = await this.cache.get('search_artists', query);
         if (cached) return cached;
 
@@ -619,6 +808,10 @@ export class LosslessAPI {
     }
 
     async searchAlbums(query, options = {}) {
+        if (this.isManifestMusicSource()) {
+            return (await this.searchManifestSource(query, options)).albums;
+        }
+
         const cached = await this.cache.get('search_albums', query);
         if (cached) return cached;
 
@@ -644,6 +837,10 @@ export class LosslessAPI {
     }
 
     async searchPlaylists(query, options = {}) {
+        if (this.isManifestMusicSource()) {
+            return (await this.searchManifestSource(query, options)).playlists;
+        }
+
         const cached = await this.cache.get('search_playlists', query);
         if (cached) return cached;
 
@@ -1628,6 +1825,10 @@ export class LosslessAPI {
     }
 
     async getStreamUrl(id, quality = 'LOSSLESS', download = false) {
+        if (this.isManifestMusicSource()) {
+            return this.getManifestSourceStreamUrl(id);
+        }
+
         const cacheKey = `stream_info_${id}_${quality}`;
 
         if (this.streamCache.has(cacheKey)) {

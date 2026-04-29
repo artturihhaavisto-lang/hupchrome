@@ -32,6 +32,7 @@ import {
     pwaUpdateSettings,
     contentBlockingSettings,
     musicProviderSettings,
+    musicSourceSettings,
     gaplessPlaybackSettings,
     analyticsSettings,
     modalSettings,
@@ -834,6 +835,19 @@ export async function initializeSettings(scrobbler, player, api, ui) {
         musicProviderSetting.addEventListener('change', (e) => {
             musicProviderSettings.setProvider(e.target.value);
             // Reload page to apply changes
+            window.location.reload();
+        });
+    }
+
+    const musicSourceSetting = document.getElementById('music-source-setting');
+    if (musicSourceSetting) {
+        musicSourceSetting.innerHTML = musicSourceSettings
+            .getSources()
+            .map((source) => `<option value="${source.id}">${source.name}</option>`)
+            .join('');
+        musicSourceSetting.value = musicSourceSettings.getSource();
+        musicSourceSetting.addEventListener('change', (e) => {
+            musicSourceSettings.setSource(e.target.value);
             window.location.reload();
         });
     }

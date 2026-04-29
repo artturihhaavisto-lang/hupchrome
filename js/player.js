@@ -52,6 +52,8 @@ export class Player {
         this.shuffleActive = false;
         this.repeatMode = REPEAT_MODE.OFF;
         this.preloadCache = new Map();
+        this.blobPlaybackUrls = new Map();
+        this.retiredBlobPlaybackUrls = new Map();
         this._pendingPreload = false;
         setInterval(this.checkPreloadConditions.bind(this), 2000);
         this.preloadAbortController = null;
@@ -544,6 +546,56 @@ export class Player {
 
     preloadNextTracks() {
         this._pendingPreload = true;
+        if (this.activeElement && !this.activeElement.paused) {
+            void this._executePreloadNextTracks().catch(console.error);
+        }
+    }
+
+    releasePreloadEntry(trackId) {
+        const entry = this.preloadCache.get(trackId);
+        if (entry?.preloader) {
+            entry.preloader.src = '';
+            entry.preloader.removeAttribute('src');
+        }
+        this.preloadCache.delete(trackId);
+    }
+
+    revokeBlobPlaybackUrl(url) {
+        if (!url || !url.startsWith('blob:')) return;
+        try {
+            URL.revokeObjectURL(url);
+        } catch {}
+    }
+
+    retireCurrentBlobPlaybackUrl(previousTrackId) {
+        if (!previousTrackId) return;
+        const url = this.blobPlaybackUrls.get(previousTrackId);
+        if (!url) return;
+        this.blobPlaybackUrls.delete(previousTrackId);
+        this.retiredBlobPlaybackUrls.set(previousTrackId, url);
+    }
+
+    cleanupRetiredBlobPlaybackUrls(activeTrackId = this.currentTrack?.id) {
+        for (const [trackId, url] of this.retiredBlobPlaybackUrls) {
+            if (trackId === activeTrackId) continue;
+            this.revokeBlobPlaybackUrl(url);
+            this.retiredBlobPlaybackUrls.delete(trackId);
+        }
+    }
+
+    clearPreloadAndBlobCaches() {
+        for (const trackId of this.preloadCache.keys()) {
+            this.releasePreloadEntry(trackId);
+        }
+        for (const url of this.blobPlaybackUrls.values()) {
+            this.revokeBlobPlaybackUrl(url);
+        }
+        for (const url of this.retiredBlobPlaybackUrls.values()) {
+            this.revokeBlobPlaybackUrl(url);
+        }
+        this.preloadCache.clear();
+        this.blobPlaybackUrls.clear();
+        this.retiredBlobPlaybackUrls.clear();
     }
 
     async checkPreloadConditions() {
@@ -592,6 +644,21 @@ export class Player {
 
                 if (this.preloadAbortController.signal.aborted) break;
 
+                if (streamInfo.forceBlobPlayback && streamInfo.url && !streamInfo.url.startsWith('blob:')) {
+                    const response = await fetch(streamInfo.url, { signal: this.preloadAbortController.signal });
+                    if (!response.ok) {
+                        throw new Error(`Failed to preload FLAC stream: HTTP ${response.status}`);
+                    }
+                    const blob = await response.blob();
+                    if (this.preloadAbortController.signal.aborted) {
+                        return;
+                    }
+                    streamInfo.originalUrl = streamInfo.url;
+                    streamInfo.url = URL.createObjectURL(blob);
+                    streamInfo.forceBlobPlayback = false;
+                    streamInfo.blobPlayback = true;
+                }
+
                 // Also preload ReplayGain legacy metadata if the fast manifest endpoint failed to provide it
                 if (track.type !== 'video' && !streamInfo.rgInfo) {
                     try {
@@ -607,6 +674,7 @@ export class Player {
                     } catch (_e) {} // Fail silently
                 }
 
+                this.releasePreloadEntry(track.id);
                 this.preloadCache.set(track.id, streamInfo);
                 const streamUrl = streamInfo.url;
 
@@ -737,6 +805,10 @@ export class Player {
             return false;
         }
 
+        if (streamInfo.blobPlayback) {
+            this.blobPlaybackUrls.set(track.id, streamUrl);
+        }
+
         const requiresShaka = !track.isLocal && (streamUrl.startsWith('blob:') || streamUrl.includes('.mpd'));
         if (requiresShaka && (!this.shakaPlayer || this.shakaPlayer.getMediaElement() !== activeElement)) {
             return false;
@@ -812,6 +884,7 @@ export class Player {
                 }
 
                 this.preloadNextTracks();
+                this.releasePreloadEntry(track.id);
             })
             .catch((error) => retryImmediateHandoff(error).catch(console.error));
 
@@ -1014,6 +1087,7 @@ export class Player {
             return;
         }
 
+        const previousTrackId = this.currentTrack?.id;
         const previousActiveElement = this.activeElement;
         const shouldPreserveGestureToken =
             preserveGestureToken && previousActiveElement === this.audio && track.type !== 'video';
@@ -1044,6 +1118,7 @@ export class Player {
         }
 
         this.currentTrack = track;
+        this.retireCurrentBlobPlaybackUrl(previousTrackId);
         this.addToRecentlyPlayed(track.id);
         const trackTitle = getTrackTitle(track);
         const artistName = getTrackArtists(track);
@@ -1370,6 +1445,18 @@ export class Player {
                 if (this.playbackSequence !== currentSequence) return;
 
                 streamUrl = resolvedStreamInfo.url;
+                if (resolvedStreamInfo.blobPlayback && streamUrl?.startsWith('blob:')) {
+                    this.blobPlaybackUrls.set(track.id, streamUrl);
+                }
+                if (resolvedStreamInfo.forceBlobPlayback && streamUrl && !streamUrl.startsWith('blob:')) {
+                    const response = await fetch(streamUrl);
+                    if (!response.ok) {
+                        throw new Error(`Failed to load FLAC stream: HTTP ${response.status}`);
+                    }
+                    const blob = await response.blob();
+                    streamUrl = URL.createObjectURL(blob);
+                    this.blobPlaybackUrls.set(track.id, streamUrl);
+                }
 
                 if (resolvedStreamInfo.rgInfo) {
                     this.currentRgValues = resolvedStreamInfo.rgInfo;
@@ -1451,6 +1538,7 @@ export class Player {
             }
 
             this.preloadNextTracks();
+            this.cleanupRetiredBlobPlaybackUrls();
         } catch (error) {
             if (this.playbackSequence !== currentSequence) return;
             if (error && (error.name === 'NotAllowedError' || error.name === 'AbortError')) {
@@ -1958,7 +2046,7 @@ export class Player {
             this.currentQueueIndex = this.queue.findIndex((t) => t.id === currentTrack?.id);
         }
 
-        this.preloadCache.clear();
+        this.clearPreloadAndBlobCaches();
         this.preloadNextTracks();
         await this.saveQueueState();
     }
@@ -1976,7 +2064,7 @@ export class Player {
         this.queue = tracks;
         this.currentQueueIndex = startIndex;
         this.shuffleActive = false;
-        this.preloadCache.clear();
+        this.clearPreloadAndBlobCaches();
         await this.saveQueueState();
     }
 
@@ -2125,7 +2213,7 @@ export class Player {
             this.currentQueueIndex = -1;
         }
 
-        this.preloadCache.clear();
+        this.clearPreloadAndBlobCaches();
         await this.saveQueueState();
     }
 
@@ -2133,6 +2221,7 @@ export class Player {
         const el = this.activeElement;
         el.pause();
         el.src = '';
+        this.clearPreloadAndBlobCaches();
         this.currentTrack = null;
         this.queue = [];
         this.shuffledQueue = [];

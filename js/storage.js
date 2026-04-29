@@ -3032,6 +3032,59 @@ export const musicProviderSettings = {
     },
 };
 
+export const musicSourceSettings = {
+    STORAGE_KEY: 'music-source',
+    DEFAULT_SOURCE: 'tidal',
+    SOURCES: [
+        {
+            id: 'tidal',
+            name: 'TIDAL / Monochrome',
+            manifestUrl: null,
+            baseUrl: null,
+        },
+        {
+            id: 'spotiflac',
+            name: 'SpotiFLAC',
+            manifestUrl: 'https://spotiflac.eclipsemusic.app/678b78ad3dde26ab/manifest.json',
+            baseUrl: 'https://spotiflac.eclipsemusic.app/678b78ad3dde26ab',
+        },
+        {
+            id: 'claudiflac',
+            name: 'ClaudiFLAC',
+            manifestUrl: 'https://spotiflac-eclipse.cyrusna29.workers.dev/manifest.json',
+            baseUrl: 'https://spotiflac-eclipse.cyrusna29.workers.dev',
+        },
+        {
+            id: 'all-in-one-lossless',
+            name: 'All In One (Lossless)',
+            manifestUrl: 'https://all-in-one.cyrusna29.workers.dev/eyJxIjoiTE9TU0xFU1MifQ/manifest.json',
+            baseUrl: 'https://all-in-one.cyrusna29.workers.dev/eyJxIjoiTE9TU0xFU1MifQ',
+            proxyRequests: true,
+        },
+    ],
+
+    getSource() {
+        try {
+            const source = localStorage.getItem(this.STORAGE_KEY) || this.DEFAULT_SOURCE;
+            return this.SOURCES.some((s) => s.id === source) ? source : this.DEFAULT_SOURCE;
+        } catch {
+            return this.DEFAULT_SOURCE;
+        }
+    },
+
+    setSource(source) {
+        localStorage.setItem(this.STORAGE_KEY, source);
+    },
+
+    getSourceConfig(source = this.getSource()) {
+        return this.SOURCES.find((s) => s.id === source) || this.SOURCES[0];
+    },
+
+    getSources() {
+        return this.SOURCES;
+    },
+};
+
 export const modalSettings = {
     STORAGE_KEY: 'close-modals-on-navigation',
     INTERCEPT_BACK_KEY: 'intercept-back-to-close-modals',

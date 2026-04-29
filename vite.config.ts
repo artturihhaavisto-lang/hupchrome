@@ -14,7 +14,28 @@ function proxyAudioPlugin() {
     return {
         name: 'proxy-audio-dev',
         configureServer(server) {
-            // No longer needed: local proxy-audio middleware replaced by remote proxy
+            server.middlewares.use('/proxy-json', async (req, res) => {
+                try {
+                    const requestUrl = new URL(req.url || '', 'http://localhost');
+                    const target = requestUrl.searchParams.get('url');
+                    if (!target || !/^https:\/\/all-in-one\.cyrusna29\.workers\.dev\//.test(target)) {
+                        res.statusCode = 400;
+                        res.end('Invalid proxy target');
+                        return;
+                    }
+
+                    const upstream = await fetch(target);
+                    const body = await upstream.text();
+                    res.statusCode = upstream.status;
+                    res.setHeader('content-type', upstream.headers.get('content-type') || 'application/json');
+                    res.setHeader('access-control-allow-origin', '*');
+                    res.end(body);
+                } catch (error) {
+                    res.statusCode = 502;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+                }
+            });
         },
     };
 }

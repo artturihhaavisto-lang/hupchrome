@@ -7,7 +7,7 @@ import svgUse from './vite-plugin-svg-use.js';
 import uploadPlugin from './vite-plugin-upload.js';
 // import purgecss from 'vite-plugin-purgecss';
 import { playwright } from '@vitest/browser-playwright';
-import { execSync } from 'child_process';
+import { execSync, spawn } from 'child_process';
 import purgecss from 'vite-plugin-purgecss';
 
 function proxyAudioPlugin() {
@@ -28,6 +28,48 @@ function proxyAudioPlugin() {
     return {
         name: 'proxy-audio-dev',
         configureServer(server) {
+            server.middlewares.use('/proxy-audio', async (req, res) => {
+                try {
+                    const requestUrl = new URL(req.url || '', 'http://localhost');
+                    const target = requestUrl.searchParams.get('url');
+                    if (!target) {
+                        res.statusCode = 400;
+                        res.end('Missing proxy target');
+                        return;
+                    }
+
+                    const upstream = await fetch(target, {
+                        headers: req.headers.range ? { range: String(req.headers.range) } : undefined,
+                    });
+
+                    res.statusCode = upstream.status;
+                    res.setHeader(
+                        'content-type',
+                        upstream.headers.get('content-type') || 'application/octet-stream'
+                    );
+                    res.setHeader('access-control-allow-origin', '*');
+                    res.setHeader('accept-ranges', upstream.headers.get('accept-ranges') || 'bytes');
+                    const contentLength = upstream.headers.get('content-length');
+                    const contentRange = upstream.headers.get('content-range');
+                    if (contentLength) res.setHeader('content-length', contentLength);
+                    if (contentRange) res.setHeader('content-range', contentRange);
+                    if (upstream.body) {
+                        const reader = upstream.body.getReader();
+                        res.on('close', () => reader.cancel().catch(() => {}));
+                        while (true) {
+                            const { done, value } = await reader.read();
+                            if (done) break;
+                            res.write(Buffer.from(value));
+                        }
+                    }
+                    res.end();
+                } catch (error) {
+                    res.statusCode = 502;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+                }
+            });
+
             server.middlewares.use('/proxy-json', async (req, res) => {
                 try {
                     const requestUrl = new URL(req.url || '', 'http://localhost');
@@ -39,6 +81,64 @@ function proxyAudioPlugin() {
                     }
 
                     const upstream = await fetch(target);
+                    const body = await upstream.text();
+                    res.statusCode = upstream.status;
+                    res.setHeader('content-type', upstream.headers.get('content-type') || 'application/json');
+                    res.setHeader('access-control-allow-origin', '*');
+                    res.end(body);
+                } catch (error) {
+                    res.statusCode = 502;
+                    res.setHeader('content-type', 'application/json');
+                    res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+                }
+            });
+        },
+    };
+}
+
+function localYouTubeMusicBridgePlugin() {
+    let bridgeProcess = null;
+    const bridgeHost = '127.0.0.1';
+    const bridgePort = '33123';
+
+    const ensureBridgeRunning = () => {
+        if (bridgeProcess && bridgeProcess.exitCode === null) return;
+
+        bridgeProcess = spawn(
+            path.resolve(__dirname, '.venv/bin/python'),
+            [path.resolve(__dirname, 'scripts/ytmusic_local_bridge.py')],
+            {
+                env: {
+                    ...process.env,
+                    MONOCHROME_YTM_BRIDGE_HOST: bridgeHost,
+                    MONOCHROME_YTM_BRIDGE_PORT: bridgePort,
+                },
+                stdio: 'inherit',
+            }
+        );
+
+        const cleanup = () => {
+            if (bridgeProcess && bridgeProcess.exitCode === null) {
+                bridgeProcess.kill();
+            }
+        };
+
+        process.once('exit', cleanup);
+        process.once('SIGINT', cleanup);
+        process.once('SIGTERM', cleanup);
+    };
+
+    return {
+        name: 'local-youtube-music-bridge',
+        configureServer(server) {
+            if (process.env.VITEST) return;
+            ensureBridgeRunning();
+
+            server.middlewares.use('/local-youtube-music', async (req, res) => {
+                try {
+                    const requestUrl = new URL(req.url || '', 'http://localhost');
+                    const upstreamUrl = `http://${bridgeHost}:${bridgePort}${requestUrl.pathname}${requestUrl.search}`;
+                    const upstream = await fetch(upstreamUrl);
                     const body = await upstream.text();
                     res.statusCode = upstream.status;
                     res.setHeader('content-type', upstream.headers.get('content-type') || 'application/json');
@@ -124,6 +224,7 @@ export default defineConfig((_options) => {
             },
         },
         plugins: [
+            localYouTubeMusicBridgePlugin(),
             proxyAudioPlugin(),
             purgecss({
                 variables: false, // DO NOT REMOVE UNUSED VARIABLES (breaks web components like am-lyrics)

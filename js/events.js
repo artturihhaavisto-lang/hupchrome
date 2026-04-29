@@ -378,6 +378,30 @@ async function handleSelectionAction(action) {
 export async function initializePlayerEvents(player, audioPlayer, scrobbler, ui) {
     if (homeStartRadioBtn) {
         homeStartRadioBtn.addEventListener('click', async () => {
+            const seedTrack = player.currentTrack || player.getCurrentQueue()?.[player.currentQueueIndex];
+            let recommendedTracks = [];
+
+            homeStartRadioBtn.disabled = true;
+            try {
+                if (seedTrack?.id) {
+                    recommendedTracks = await player.api.getRecommendedTracksForPlaylist([seedTrack], 20, {
+                        knownTrackIds: new Set(player.getCurrentQueue().map((track) => track.id)),
+                    });
+                }
+            } finally {
+                homeStartRadioBtn.disabled = false;
+            }
+
+            if (recommendedTracks.length > 0) {
+                await player.enableRadio(recommendedTracks, { prefillQueue: true });
+                return;
+            }
+
+            if (seedTrack?.id) {
+                await player.enableRadio([seedTrack], { prefillQueue: true });
+                return;
+            }
+
             await player.enableRadio();
         });
     }
@@ -1629,6 +1653,7 @@ export async function handleTrackAction(
         modal.classList.add('active');
     } else if (action === 'go-to-artist') {
         const artistId = extraData?.artistId || item.artist?.id || item.artists?.[0]?.id;
+        const artistName = item.artist?.name || item.artists?.[0]?.name || '';
         const trackerSheetId = extraData?.trackerSheetId || (item.isTracker ? item.trackerInfo?.sheetId : null);
 
         if (trackerSheetId) {

@@ -157,16 +157,14 @@ export class MusicAPI {
     }
 
     async getArtist(id) {
-        const api = this.getAPI();
         const cleanId = this.stripProviderPrefix(id);
-        return api.getArtist(cleanId);
+        return this.tidalAPI.getArtist(cleanId);
     }
 
     async getArtistBiography(id) {
-        const api = this.getAPI();
         const cleanId = this.stripProviderPrefix(id);
-        if (typeof api.getArtistBiography === 'function') {
-            return api.getArtistBiography(cleanId);
+        if (typeof this.tidalAPI.getArtistBiography === 'function') {
+            return this.tidalAPI.getArtistBiography(cleanId);
         }
         return null;
     }
@@ -240,14 +238,14 @@ export class MusicAPI {
 
     // Cover/artwork methods
     getCoverUrl(id, size = '320') {
-        if (typeof id === 'string' && id.startsWith('blob:')) {
+        if (typeof id === 'string' && (id.startsWith('blob:') || id.startsWith('http://') || id.startsWith('https://'))) {
             return id;
         }
         return this.tidalAPI.getCoverUrl(this.stripProviderPrefix(id), size);
     }
 
     getCoverSrcset(id) {
-        if (typeof id === 'string' && id.startsWith('blob:')) {
+        if (typeof id === 'string' && (id.startsWith('blob:') || id.startsWith('http://') || id.startsWith('https://'))) {
             return '';
         }
         return this.tidalAPI.getCoverSrcset(this.stripProviderPrefix(id));
@@ -290,10 +288,16 @@ export class MusicAPI {
     }
 
     getArtistPictureUrl(id, size = '320') {
+        if (typeof id === 'string' && (id.startsWith('blob:') || id.startsWith('http://') || id.startsWith('https://'))) {
+            return id;
+        }
         return this.tidalAPI.getArtistPictureUrl(this.stripProviderPrefix(id), size);
     }
 
     getArtistPictureSrcset(id) {
+        if (typeof id === 'string' && (id.startsWith('blob:') || id.startsWith('http://') || id.startsWith('https://'))) {
+            return '';
+        }
         return this.tidalAPI.getArtistPictureSrcset(this.stripProviderPrefix(id));
     }
 
@@ -359,6 +363,12 @@ export class MusicAPI {
         return id;
     }
 
+    isTidalCompatibleId(id) {
+        if (typeof id === 'number') return Number.isFinite(id);
+        if (typeof id === 'string') return /^\d+$/.test(id.trim());
+        return false;
+    }
+
     // Download methods
     async downloadTrack(id, quality, filename, options = {}) {
         const api = this.getAPI();
@@ -368,9 +378,8 @@ export class MusicAPI {
 
     // Similar/recommendation methods
     async getSimilarArtists(artistId) {
-        const api = this.getAPI();
         const cleanId = this.stripProviderPrefix(artistId);
-        return api.getSimilarArtists(cleanId);
+        return this.tidalAPI.getSimilarArtists(cleanId);
     }
 
     async getArtistTopTracks(artistId, options = {}) {
@@ -386,6 +395,13 @@ export class MusicAPI {
     async getRecommendedTracksForPlaylist(tracks, limit = 20, options = {}) {
         // Use Tidal for recommendations
         return this.tidalAPI.getRecommendedTracksForPlaylist(tracks, limit, options);
+    }
+
+    async getYouTubeMusicRecommendations(tracks, limit = 20, options = {}) {
+        if (typeof this.tidalAPI.getYouTubeMusicRecommendations === 'function') {
+            return this.tidalAPI.getYouTubeMusicRecommendations(tracks, limit, options);
+        }
+        return [];
     }
 
     // Cache methods

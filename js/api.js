@@ -71,6 +71,26 @@ export class LosslessAPI {
         return this.getSelectedMusicSource()?.id === 'youtube-music';
     }
 
+    shouldForceBlobPlaybackForYouTube() {
+        if (typeof window === 'undefined') return true;
+        const hostname = window.location?.hostname || '';
+        return hostname !== '127.0.0.1' && hostname !== 'localhost';
+    }
+
+    getLocalYouTubeMusicBridgeUrl(path) {
+        return `/local-youtube-music${path.startsWith('/') ? path : `/${path}`}`;
+    }
+
+    async fetchLocalYouTubeMusicBridge(path, options = {}) {
+        const response = await fetch(this.getLocalYouTubeMusicBridgeUrl(path), {
+            signal: options.signal,
+        });
+        if (!response.ok) {
+            throw new Error(`Local YouTube Music bridge failed: HTTP ${response.status}`);
+        }
+        return response.json();
+    }
+
     isYouTubeVideoId(id) {
         return typeof id === 'string' && /^[a-zA-Z0-9_-]{11}$/.test(id);
     }
@@ -88,6 +108,19 @@ export class LosslessAPI {
             return url;
         }
         return `/proxy-json?url=${encodeURIComponent(url)}`;
+    }
+
+    parseDurationSeconds(value) {
+        if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+        if (typeof value !== 'string') return 0;
+
+        const trimmed = value.trim();
+        if (!trimmed) return 0;
+        if (/^\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
+
+        const parts = trimmed.split(':').map((part) => Number.parseInt(part, 10));
+        if (parts.length < 2 || parts.some((part) => Number.isNaN(part))) return 0;
+        return parts.reduce((total, part) => total * 60 + part, 0);
     }
 
     normalizeManifestArtist(artist, fallbackId = null) {
@@ -120,7 +153,7 @@ export class LosslessAPI {
             id: track.id,
             title: track.title || track.name || 'Unknown Track',
             type: 'track',
-            duration: track.duration || 0,
+            duration: this.parseDurationSeconds(track.duration || track.durationSeconds || track.lengthSeconds),
             artist,
             artists:
                 track.artists?.map((a, i) => this.normalizeManifestArtist(a, `${track.id}-artist-${i}`)) ||
@@ -208,8 +241,13 @@ export class LosslessAPI {
         }
 
         try {
+            const signal =
+                options.signal ||
+                (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+                    ? AbortSignal.timeout(2500)
+                    : undefined);
             const response = await fetch(unwrappedUrl, {
-                signal: options.signal,
+                signal,
                 headers: {
                     accept: 'application/json,text/plain;q=0.9,*/*;q=0.8',
                 },
@@ -292,58 +330,69 @@ export class LosslessAPI {
             return cached;
         }
 
-        const candidates = [
-            `/stream/${encodeURIComponent(id)}.json`,
-            `/stream/${encodeURIComponent(id)}`,
-            `/stream?id=${encodeURIComponent(id)}`,
-        ];
+        const encodedId = encodeURIComponent(id);
+        const candidates =
+            source?.streamPathMode === 'path'
+                ? [`/stream/${encodedId}`]
+                : [`/stream/${encodedId}`, `/stream/${encodedId}.json`, `/stream?id=${encodedId}`];
 
-        let lastError = null;
-        for (const path of candidates) {
-            try {
-                const response = await fetch(this.buildManifestSourceFetchUrl(path, source), {
-                    signal: options.signal,
-                });
-                if (!response.ok) {
-                    lastError = new Error(`HTTP ${response.status}`);
-                    continue;
-                }
-
-                const data = await response.json();
-                const url =
-                    data.url ||
-                    data.streamUrl ||
-                    data.originalTrackUrl ||
-                    data.OriginalTrackUrl ||
-                    data.streams?.[0]?.url ||
-                    data.sources?.[0]?.url;
-                if (url) {
-                    const resolvedUrl = await this.resolvePlayableUrlCandidate(url, options);
-                    const result = {
-                        url: resolvedUrl,
-                        format: data.format || null,
-                        quality: data.quality || null,
-                        source: data.source || null,
-                        expiresAt: data.expiresAt || null,
-                        manifestSourceId: source?.id || null,
-                        forceBlobPlayback: false,
-                        rgInfo: {
-                            trackReplayGain: null,
-                            trackPeakAmplitude: null,
-                            albumReplayGain: null,
-                            albumPeakAmplitude: null,
-                        },
-                    };
-                    this.streamCache.set(cacheKey, result);
-                    return result;
-                }
-            } catch (error) {
-                if (error.name === 'AbortError') throw error;
-                lastError = error;
+        const lookupPromises = candidates.map(async (path) => {
+            const signal =
+                options.signal ||
+                (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+                    ? AbortSignal.timeout(5000)
+                    : undefined);
+            const response = await fetch(this.buildManifestSourceFetchUrl(path, source), { signal });
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
             }
+
+            const data = await response.json();
+            const url =
+                data.url ||
+                data.streamUrl ||
+                data.originalTrackUrl ||
+                data.OriginalTrackUrl ||
+                data.streams?.[0]?.url ||
+                data.sources?.[0]?.url;
+            if (!url) {
+                throw new Error('Manifest stream payload missing URL');
+            }
+
+            const resolvedUrl = await this.resolvePlayableUrlCandidate(url, options);
+            return {
+                url: resolvedUrl,
+                format: data.format || null,
+                quality: data.quality || null,
+                source: data.source || null,
+                expiresAt: data.expiresAt || null,
+                manifestSourceId: source?.id || null,
+                forceBlobPlayback: false,
+                rgInfo: {
+                    trackReplayGain: null,
+                    trackPeakAmplitude: null,
+                    albumReplayGain: null,
+                    albumPeakAmplitude: null,
+                },
+            };
+        });
+
+        const settled = await Promise.allSettled(lookupPromises);
+        const fulfilled = settled.find((entry) => entry.status === 'fulfilled');
+        if (fulfilled) {
+            const result = fulfilled.value;
+            this.streamCache.set(cacheKey, result);
+            return result;
         }
 
-        throw lastError || new Error(`Could not resolve manifest source stream URL for ID: ${id}`);
+        const aborted = settled.find(
+            (entry) => entry.status === 'rejected' && entry.reason?.name === 'AbortError'
+        );
+        if (aborted) {
+            throw aborted.reason;
+        }
+        const firstError = settled.find((entry) => entry.status === 'rejected');
+        throw firstError?.reason || new Error(`Could not resolve manifest source stream URL for ID: ${id}`);
     }
 
     buildManifestFallbackQuery(track) {
@@ -368,15 +417,35 @@ export class LosslessAPI {
 
         const selected = this.getSelectedMusicSource()?.id;
         const preferred = track?.manifestSourceId || track?.source;
+        const fallbackPriority = new Map([
+            ['all-in-one', 0],
+            ['claudiflac', 1],
+            ['spotiflac', 2],
+            ['soundcloud', 3],
+        ]);
         const sources = this.getManifestMusicSources()
             .filter((source) => source.id !== selected && source.id !== preferred)
             .concat(
                 this.getManifestMusicSources().filter((source) => source.id === preferred && source.id !== selected)
-            );
+            )
+            .sort((a, b) => (fallbackPriority.get(a.id) ?? 50) - (fallbackPriority.get(b.id) ?? 50));
 
         let lastError = null;
         for (const source of sources) {
             try {
+                if (track?.id) {
+                    try {
+                        const directStream = await this.getManifestSourceStreamUrl(track.id, options, source);
+                        return {
+                            ...directStream,
+                            fallbackSource: source.id,
+                        };
+                    } catch (directError) {
+                        if (directError.name === 'AbortError') throw directError;
+                        lastError = directError;
+                    }
+                }
+
                 const results = await this.searchManifestSource(query, options, source);
                 const candidate = results.tracks?.items?.[0];
                 if (!candidate?.id) continue;
@@ -393,6 +462,12 @@ export class LosslessAPI {
         }
 
         throw lastError || new Error('No Eclipse addon source could resolve this track');
+    }
+
+    shouldPreferManifestFallbackBeforeSelected(track) {
+        const selected = this.getSelectedMusicSource()?.id;
+        if (!selected || selected === 'all-in-one') return false;
+        return typeof track?.id === 'string' && /^(hifi|dz|sc)_/.test(track.id);
     }
 
     pruneStreamCache() {
@@ -535,7 +610,7 @@ export class LosslessAPI {
         const params = new URLSearchParams({
             id: videoId,
             itag: String(format.itag),
-            local: 'false',
+            local: 'true',
         });
         return `${instance.replace(/\/+$/, '')}/latest_version?${params.toString()}`;
     }
@@ -565,9 +640,14 @@ export class LosslessAPI {
         });
 
         for (const format of orderedFormats) {
-            const streamUrl = this.buildInvidiousAudioStreamUrl(instance, videoId, format);
-            if (await this.validateAudioStreamUrl(streamUrl, options)) {
-                return streamUrl;
+            const directUrl = format.url;
+            if (await this.validateAudioStreamUrl(directUrl, options)) {
+                return directUrl;
+            }
+
+            const proxyUrl = this.buildInvidiousAudioStreamUrl(instance, videoId, format);
+            if (proxyUrl !== directUrl && (await this.validateAudioStreamUrl(proxyUrl, options))) {
+                return proxyUrl;
             }
         }
 
@@ -647,6 +727,7 @@ export class LosslessAPI {
             isYoutubeFallback: true,
             fallbackSource: 'youtube-music',
             fallbackVideoId: bestCandidate.videoId,
+            forceBlobPlayback: this.shouldForceBlobPlaybackForYouTube(),
         };
         this.streamCache.set(cacheKey, result);
         return result;
@@ -655,9 +736,14 @@ export class LosslessAPI {
     normalizeYouTubeMusicTrack(candidate) {
         const videoId = candidate?.videoId || candidate?.id;
         const author = candidate?.author || candidate?.authorName || 'YouTube Music';
+        const thumbnailList = Array.isArray(candidate?.videoThumbnails)
+            ? candidate.videoThumbnails
+            : Array.isArray(candidate?.thumbnail)
+              ? candidate.thumbnail
+              : [];
         const thumbnail =
-            candidate?.videoThumbnails?.find((thumb) => thumb.quality === 'medium')?.url ||
-            candidate?.videoThumbnails?.[0]?.url ||
+            thumbnailList.find((thumb) => thumb.quality === 'medium')?.url ||
+            thumbnailList[thumbnailList.length - 1]?.url ||
             candidate?.authorThumbnails?.[0]?.url ||
             null;
 
@@ -665,7 +751,9 @@ export class LosslessAPI {
             id: videoId,
             title: candidate?.title || 'Unknown Track',
             type: 'track',
-            duration: candidate?.lengthSeconds || candidate?.duration || 0,
+            duration: this.parseDurationSeconds(
+                candidate?.lengthSeconds || candidate?.durationSeconds || candidate?.duration_seconds || candidate?.duration
+            ),
             artist: {
                 id: candidate?.authorId || author,
                 name: author,
@@ -681,8 +769,8 @@ export class LosslessAPI {
                 },
             ],
             album: {
-                id: null,
-                title: 'YouTube Music',
+                id: candidate?.album?.id || null,
+                title: candidate?.album?.name || candidate?.album?.title || 'YouTube Music',
                 cover: thumbnail,
             },
             audioQuality: 'HIGH',
@@ -696,6 +784,25 @@ export class LosslessAPI {
     }
 
     async searchYouTubeMusicSource(query, options = {}) {
+        try {
+            const data = await this.fetchLocalYouTubeMusicBridge(`/search?${new URLSearchParams({ q: query })}`, options);
+            const tracks = (Array.isArray(data) ? data : [])
+                .filter((candidate) => candidate?.type === 'video' && candidate?.videoId)
+                .map((candidate) => this.normalizeYouTubeMusicTrack(candidate));
+
+            if (tracks.length > 0) {
+                return {
+                    tracks: this.normalizeManifestSearchSection(tracks),
+                    videos: this.normalizeManifestSearchSection([]),
+                    artists: this.normalizeManifestSearchSection([]),
+                    albums: this.normalizeManifestSearchSection([]),
+                    playlists: this.normalizeManifestSearchSection([]),
+                };
+            }
+        } catch (error) {
+            console.warn('Local YouTube Music bridge search failed, falling back to Invidious:', error);
+        }
+
         const instances = await this.getYouTubeFallbackInstances(options);
         let lastError = null;
 
@@ -730,10 +837,273 @@ export class LosslessAPI {
         throw lastError || new Error('YouTube Music search failed');
     }
 
+    getYouTubeVideoIdFromTrack(track) {
+        if (!track) return null;
+        if (track.youtubeVideoId) return track.youtubeVideoId;
+        if (track.fallbackVideoId) return track.fallbackVideoId;
+        if (track.streamInfo?.fallbackVideoId) return track.streamInfo.fallbackVideoId;
+        if (track.source === 'youtube-music' && this.isYouTubeVideoId(track.id)) return track.id;
+        return null;
+    }
+
+    async resolveYouTubeVideoIdForRecommendationSeed(track, options = {}) {
+        const existingVideoId = this.getYouTubeVideoIdFromTrack(track);
+        if (existingVideoId) return existingVideoId;
+
+        const title = track?.title || track?.name || '';
+        const artist = track?.artist?.name || track?.artists?.[0]?.name || '';
+        const query = `${title} ${artist}`.trim();
+        if (!query) return null;
+
+        const cacheKey = `youtube_seed_video_${track?.id || query}`;
+        const cached = this.streamCache.get(cacheKey);
+        if (cached) return cached;
+
+        const result = await this.searchYouTubeMusicSource(query, options);
+        const candidates = result?.tracks?.items || [];
+        const best = [...candidates]
+            .map((candidate) => ({
+                track: candidate,
+                score: this.scoreTrackConversionCandidate(track, candidate),
+            }))
+            .sort((a, b) => b.score - a.score)[0];
+
+        if (!best?.track || best.score < 50) {
+            return null;
+        }
+
+        const videoId = this.getYouTubeVideoIdFromTrack(best.track);
+        if (videoId) {
+            this.streamCache.set(cacheKey, videoId);
+        }
+        return videoId;
+    }
+
+    getYouTubeRecommendedVideoCandidates(details) {
+        const lists = [
+            details?.recommendedVideos,
+            details?.relatedVideos,
+            details?.recommendations,
+            details?.watchNext?.results,
+            details?.watchNext,
+        ];
+
+        return lists.flatMap((list) => (Array.isArray(list) ? list : []));
+    }
+
+    async getYouTubeMusicRecommendationsFromVideoId(videoId, options = {}) {
+        const cacheKey = `youtube_related_${videoId}`;
+        const cached = this.streamCache.get(cacheKey);
+        if (cached) return cached;
+
+        try {
+            const data = await this.fetchLocalYouTubeMusicBridge(
+                `/watch?${new URLSearchParams({ id: videoId })}`,
+                options
+            );
+            const tracks = (Array.isArray(data) ? data : []).map((candidate) => this.normalizeYouTubeMusicTrack(candidate));
+            if (tracks.length > 0) {
+                this.streamCache.set(cacheKey, tracks);
+                return tracks;
+            }
+        } catch (error) {
+            console.warn('Local YouTube Music bridge watch playlist failed, falling back to Invidious:', error);
+        }
+
+        const instances = await this.getYouTubeFallbackInstances(options);
+        let lastError = null;
+
+        for (const instance of instances) {
+            try {
+                const response = await fetch(`${instance}/api/v1/videos/${encodeURIComponent(videoId)}`, {
+                    signal: options.signal,
+                });
+                if (!response.ok) {
+                    lastError = new Error(`YouTube recommendation lookup failed: HTTP ${response.status}`);
+                    continue;
+                }
+
+                const details = await response.json();
+                const tracks = this.getYouTubeRecommendedVideoCandidates(details)
+                    .filter((candidate) => candidate?.videoId || candidate?.id)
+                    .map((candidate) => this.normalizeYouTubeMusicTrack(candidate));
+
+                this.streamCache.set(cacheKey, tracks);
+                return tracks;
+            } catch (error) {
+                if (error.name === 'AbortError') throw error;
+                lastError = error;
+            }
+        }
+
+        throw lastError || new Error(`Could not fetch YouTube recommendations for video: ${videoId}`);
+    }
+
+    buildYouTubeMusicRecommendationQueries(tracks = []) {
+        const queries = [];
+        const seen = new Set();
+
+        const addQuery = (query) => {
+            const normalized = String(query || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            const key = normalized.toLowerCase();
+            if (!normalized || seen.has(key)) return;
+            seen.add(key);
+            queries.push(normalized);
+        };
+
+        for (const track of tracks) {
+            const title = track?.title || track?.name || '';
+            const artist = track?.artist?.name || track?.artists?.[0]?.name || track?.author || '';
+
+            if (title && artist) {
+                addQuery(`${title} ${artist} radio`);
+                addQuery(`${title} ${artist} mix`);
+            }
+            if (artist) {
+                addQuery(`${artist} topic music`);
+                addQuery(`${artist} mix`);
+                addQuery(`${artist} greatest hits`);
+                addQuery(`${artist} similar artists`);
+            }
+        }
+
+        if (queries.length === 0) {
+            addQuery('music mix');
+            addQuery('new music');
+            addQuery('popular music');
+            addQuery('recommended music');
+        }
+
+        return queries;
+    }
+
+    normalizeRecommendationTitle(value) {
+        return String(value || '')
+            .toLowerCase()
+            .normalize('NFKD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/\([^)]*\)|\[[^\]]*\]/g, ' ')
+            .replace(/\b(official|music|video|audio|lyrics?|lyric|hq|hd|remaster(?:ed)?|live|radio edit|edit|mix|remix|extended|version|cover|karaoke|topic|visualizer|sped up|slowed|reverb|hour|hours?)\b/g, ' ')
+            .replace(/[^a-z0-9]+/g, ' ')
+            .trim();
+    }
+
+    isSameSeedSongRecommendation(seedTracks, candidate) {
+        const candidateTitle = this.normalizeRecommendationTitle(candidate?.title || candidate?.name);
+        if (!candidateTitle) return true;
+
+        for (const seed of seedTracks || []) {
+            const seedTitle = this.normalizeRecommendationTitle(seed?.title || seed?.name);
+            if (!seedTitle) continue;
+            if (candidateTitle === seedTitle) return true;
+            if (candidateTitle.includes(seedTitle) || seedTitle.includes(candidateTitle)) return true;
+        }
+
+        return false;
+    }
+
+    async getYouTubeMusicRecommendations(tracks, limit = 20, options = {}) {
+        const seedVideoIds = [];
+        for (const track of tracks || []) {
+            try {
+                const videoId = await this.resolveYouTubeVideoIdForRecommendationSeed(track, options);
+                if (videoId) seedVideoIds.push(videoId);
+            } catch (error) {
+                if (error.name === 'AbortError') throw error;
+                console.warn('Failed to resolve YouTube seed video:', error);
+            }
+        }
+        const seedIds = new Set([
+            ...(tracks || []).map((track) => track?.id).filter(Boolean),
+            ...seedVideoIds,
+        ]);
+        const knownTrackIds = options.knownTrackIds || new Set();
+        const recommendations = [];
+        const seenTrackIds = new Set([...seedIds]);
+
+        for (const videoId of [...seedVideoIds].sort(() => Math.random() - 0.5)) {
+            if (recommendations.length >= limit) break;
+
+            try {
+                const items = await this.getYouTubeMusicRecommendationsFromVideoId(videoId, options);
+
+                for (const track of items) {
+                    const trackId = track?.youtubeVideoId || track?.id;
+                    if (!trackId || seenTrackIds.has(trackId)) continue;
+
+                    seenTrackIds.add(trackId);
+                    if (knownTrackIds.has(trackId)) continue;
+                    if (this.isSameSeedSongRecommendation(tracks, track)) continue;
+
+                    recommendations.push(track);
+                    if (recommendations.length >= limit) break;
+                }
+            } catch (error) {
+                if (error.name === 'AbortError') throw error;
+                console.warn(`YouTube related-video recommendations failed for "${videoId}":`, error);
+            }
+        }
+
+        const queries = this.buildYouTubeMusicRecommendationQueries(tracks);
+        const shuffledQueries = [...queries].sort(() => Math.random() - 0.5).slice(0, 12);
+
+        for (const query of shuffledQueries) {
+            if (recommendations.length >= limit) break;
+
+            try {
+                const result = await this.searchYouTubeMusicSource(query, options);
+                const items = result?.tracks?.items || [];
+
+                for (const track of items) {
+                    const trackId = track?.youtubeVideoId || track?.id;
+                    if (!trackId || seenTrackIds.has(trackId)) continue;
+
+                    seenTrackIds.add(trackId);
+                    if (knownTrackIds.has(trackId)) continue;
+                    if (this.isSameSeedSongRecommendation(tracks, track)) continue;
+
+                    recommendations.push(track);
+                    if (recommendations.length >= limit) break;
+                }
+            } catch (error) {
+                if (error.name === 'AbortError') throw error;
+                console.warn(`YouTube Music recommendation query failed for "${query}":`, error);
+            }
+        }
+
+        return recommendations.slice(0, limit);
+    }
+
     async getYouTubeMusicSourceStreamUrl(id, options = {}) {
         const cacheKey = `youtube_music_source_${id}`;
         if (this.streamCache.has(cacheKey)) {
             return this.streamCache.get(cacheKey);
+        }
+
+        try {
+            const payload = await this.fetchLocalYouTubeMusicBridge(
+                `/stream?${new URLSearchParams({ id })}`,
+                options
+            );
+            if (payload?.url) {
+                const result = {
+                    url: payload.url,
+                    rgInfo: null,
+                    isYoutubeFallback: true,
+                    fallbackSource: 'youtube-music',
+                    fallbackVideoId: id,
+                    forceBlobPlayback: this.shouldForceBlobPlaybackForYouTube(),
+                    format: payload.format || null,
+                    estimatedBitrateKbps: payload.bitrateKbps || null,
+                    audioQuality: payload.audioQuality || 'HIGH',
+                };
+                this.streamCache.set(cacheKey, result);
+                return result;
+            }
+        } catch (error) {
+            console.warn('Local YouTube Music bridge stream lookup failed, falling back to Invidious:', error);
         }
 
         const instances = await this.getYouTubeFallbackInstances(options);
@@ -767,6 +1137,7 @@ export class LosslessAPI {
                     isYoutubeFallback: true,
                     fallbackSource: 'youtube-music',
                     fallbackVideoId: id,
+                    forceBlobPlayback: this.shouldForceBlobPlaybackForYouTube(),
                 };
                 this.streamCache.set(cacheKey, result);
                 return result;
@@ -777,6 +1148,93 @@ export class LosslessAPI {
         }
 
         throw lastError || new Error(`Could not resolve YouTube Music stream URL for ID: ${id}`);
+    }
+
+    async getSelectedSourceStreamInfoForYouTubeRecommendation(track, quality = 'LOSSLESS', options = {}) {
+        const convertedTrack = await this.convertYouTubeRecommendationToSelectedSourceTrack(track, options);
+
+        if (this.isManifestMusicSource()) {
+            return this.getManifestSourceStreamUrl(convertedTrack.id, options);
+        }
+
+        return this.getStreamUrl(convertedTrack.id, quality, options.download);
+    }
+
+    scoreTrackConversionCandidate(sourceTrack, candidate) {
+        if (!candidate?.id) return -Infinity;
+
+        const sourceTitle = this.normalizeRecommendationTitle(sourceTrack?.title || sourceTrack?.name);
+        const candidateTitle = this.normalizeRecommendationTitle(candidate?.title || candidate?.name);
+        const sourceArtist = this.normalizeRecommendationTitle(
+            sourceTrack?.artist?.name || sourceTrack?.artists?.[0]?.name || sourceTrack?.author
+        );
+        const candidateArtist = this.normalizeRecommendationTitle(
+            candidate?.artist?.name || candidate?.artists?.[0]?.name || candidate?.author
+        );
+
+        let score = 0;
+
+        if (sourceTitle && candidateTitle) {
+            if (sourceTitle === candidateTitle) score += 60;
+            else if (sourceTitle.includes(candidateTitle) || candidateTitle.includes(sourceTitle)) score += 35;
+            else {
+                const sourceTokens = new Set(sourceTitle.split(/\s+/).filter(Boolean));
+                const candidateTokens = candidateTitle.split(/\s+/).filter(Boolean);
+                const shared = candidateTokens.filter((token) => sourceTokens.has(token)).length;
+                score += shared * 8;
+            }
+        }
+
+        if (sourceArtist && candidateArtist) {
+            if (sourceArtist === candidateArtist) score += 40;
+            else if (sourceArtist.includes(candidateArtist) || candidateArtist.includes(sourceArtist)) score += 20;
+        }
+
+        const sourceDuration = Number(sourceTrack?.duration || sourceTrack?.lengthSeconds || 0);
+        const candidateDuration = Number(candidate?.duration || candidate?.lengthSeconds || 0);
+        if (sourceDuration > 0 && candidateDuration > 0) {
+            const diff = Math.abs(sourceDuration - candidateDuration);
+            if (diff <= 3) score += 20;
+            else if (diff <= 10) score += 10;
+            else if (diff > 45) score -= 25;
+        }
+
+        return score;
+    }
+
+    async convertYouTubeRecommendationToSelectedSourceTrack(track, options = {}) {
+        const source = this.getSelectedMusicSource();
+        const youtubeVideoId = track?.youtubeVideoId || (this.isYouTubeVideoId(track?.id) ? track.id : null);
+        const cacheKey = `youtube_conversion_${source?.id || 'selected'}_${youtubeVideoId || `${track?.title || ''}_${track?.artist?.name || ''}`}`;
+        const cached = this.streamCache.get(cacheKey);
+        if (cached) return cached;
+
+        const title = track?.title || '';
+        const artist = track?.artist?.name || track?.artists?.[0]?.name || '';
+        const query = `${title} ${artist}`.trim();
+
+        if (!query) {
+            throw new Error('Missing YouTube recommendation metadata for source lookup');
+        }
+
+        const searchOptions = { signal: options.signal };
+        const results = this.isManifestMusicSource()
+            ? await this.searchManifestSource(query, searchOptions)
+            : await this.searchTracks(query, searchOptions);
+        const candidates = results?.tracks?.items || results?.items || [];
+        const candidate = [...candidates]
+            .map((candidate) => ({
+                track: candidate,
+                score: this.scoreTrackConversionCandidate(track, candidate),
+            }))
+            .sort((a, b) => b.score - a.score)[0];
+
+        if (!candidate?.track?.id || candidate.score < 50) {
+            throw new Error(`No selected-source match found for YouTube recommendation: ${query}`);
+        }
+
+        this.streamCache.set(cacheKey, candidate.track);
+        return candidate.track;
     }
 
     async fetchWithRetry(relativePath, options = {}) {
@@ -2131,6 +2589,10 @@ export class LosslessAPI {
     }
 
     async getRecommendedTracksForPlaylist(tracks, limit = 20, options = {}) {
+        if (this.isYouTubeMusicSource()) {
+            return this.getYouTubeMusicRecommendations(tracks, limit, options);
+        }
+
         const artistMap = new Map();
 
         // Check if tracks already have artist info (some might)
@@ -2180,7 +2642,7 @@ export class LosslessAPI {
 
         if (artists.length === 0) {
             console.log('No artists found, cannot generate recommendations');
-            return [];
+            return this.getYouTubeMusicRecommendations(tracks, limit, options);
         }
 
         const recommendedTracks = [];
@@ -2228,7 +2690,25 @@ export class LosslessAPI {
         });
 
         const shuffled = recommendedTracks.sort(() => 0.5 - Math.random());
-        return shuffled.slice(0, limit);
+        if (shuffled.length >= limit || options.allowYouTubeMusicRecommendations === false) {
+            return shuffled.slice(0, limit);
+        }
+
+        try {
+            const youtubeTracks = await this.getYouTubeMusicRecommendations(tracks, limit - shuffled.length, {
+                ...options,
+                knownTrackIds: new Set([
+                    ...(options.knownTrackIds || []),
+                    ...tracks.map((t) => t.id),
+                    ...shuffled.map((t) => t.id),
+                ]),
+            });
+            return [...shuffled, ...youtubeTracks].slice(0, limit);
+        } catch (error) {
+            if (error.name === 'AbortError') throw error;
+            console.warn('Failed to fetch YouTube Music recommendation fallback:', error);
+            return shuffled.slice(0, limit);
+        }
     }
 
     normalizeTrackResponse(apiResponse) {
@@ -2483,13 +2963,31 @@ export class LosslessAPI {
     async getPlayableStreamInfo(trackOrId, quality = 'LOSSLESS', options = {}) {
         const track = typeof trackOrId === 'object' ? trackOrId : { id: trackOrId };
         const id = track?.id ?? trackOrId;
+        const youtubeVideoId =
+            track?.youtubeVideoId || (track?.source === 'youtube-music' && this.isYouTubeVideoId(id) ? id : null);
+
+        if (youtubeVideoId && this.isYouTubeMusicSource()) {
+            return this.getYouTubeMusicSourceStreamUrl(youtubeVideoId, options);
+        }
+
+        if (youtubeVideoId) {
+            return this.getSelectedSourceStreamInfoForYouTubeRecommendation(track, quality, options);
+        }
 
         if (this.isYouTubeMusicSource()) {
-            const videoId = track?.youtubeVideoId || (this.isYouTubeVideoId(id) ? id : null);
+            const videoId = this.isYouTubeVideoId(id) ? id : null;
             if (videoId) {
                 return this.getYouTubeMusicSourceStreamUrl(videoId, options);
             }
             return this.getYouTubeFallbackStreamUrl(track, options);
+        }
+
+        if (this.isManifestMusicSource() && this.shouldPreferManifestFallbackBeforeSelected(track)) {
+            try {
+                return await this.getManifestFallbackStreamInfo(track, options);
+            } catch (fallbackError) {
+                if (fallbackError.name === 'AbortError') throw fallbackError;
+            }
         }
 
         try {

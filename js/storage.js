@@ -2445,8 +2445,6 @@ export const sidebarSectionSettings = {
         'sidebar-nav-home',
         'sidebar-nav-library',
         'sidebar-nav-recent',
-        'sidebar-nav-unreleased',
-        'sidebar-nav-donate',
         'sidebar-nav-settings',
         'sidebar-nav-about-bottom',
         'sidebar-nav-discordbtn',
@@ -3052,6 +3050,7 @@ export const musicSourceSettings = {
             manifestUrl: 'https://spotiflac.eclipsemusic.app/ab6e65dc54c4adf8/manifest.json',
             baseUrl: 'https://spotiflac.eclipsemusic.app/ab6e65dc54c4adf8',
             proxyRequests: true,
+            streamPathMode: 'path',
         },
         {
             id: 'soundcloud',
@@ -3059,6 +3058,7 @@ export const musicSourceSettings = {
             manifestUrl: 'https://eclipse3.cyrusna29.workers.dev/manifest.json',
             baseUrl: 'https://eclipse3.cyrusna29.workers.dev',
             proxyRequests: true,
+            streamPathMode: 'path',
         },
         {
             id: 'claudiflac',
@@ -3066,6 +3066,7 @@ export const musicSourceSettings = {
             manifestUrl: 'https://spotiflac-eclipse.cyrusna29.workers.dev/manifest.json',
             baseUrl: 'https://spotiflac-eclipse.cyrusna29.workers.dev',
             proxyRequests: true,
+            streamPathMode: 'path',
         },
         {
             id: 'all-in-one',
@@ -3073,6 +3074,7 @@ export const musicSourceSettings = {
             manifestUrl: 'https://all-in-one.cyrusna29.workers.dev/manifest.json',
             baseUrl: 'https://all-in-one.cyrusna29.workers.dev',
             proxyRequests: true,
+            streamPathMode: 'path',
         },
     ],
 

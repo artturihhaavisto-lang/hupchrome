@@ -27,7 +27,7 @@ vi.mock('../storage.js', () => ({
         isPreservePitchEnabled: vi.fn(() => true),
         setPreservePitch: vi.fn(),
     },
-    radioSettings: { isEnabled: vi.fn(() => false) },
+    radioSettings: { isEnabled: vi.fn(() => false), setEnabled: vi.fn() },
     autoplaySettings: { isEnabled: vi.fn(() => false) },
     binauralDspSettings: { getAutoEnableForSpatial: vi.fn(() => false), isEnabled: vi.fn(() => false) },
     contentBlockingSettings: {
@@ -36,6 +36,7 @@ vi.mock('../storage.js', () => ({
         shouldHideArtist: vi.fn(() => false),
     },
     qualityBadgeSettings: { isEnabled: vi.fn(() => true) },
+    musicSourceSettings: { getSourceConfig: vi.fn((id) => ({ id, name: id })) },
     coverArtSizeSettings: { getSize: vi.fn(() => '1280') },
     apiSettings: {
         loadInstancesFromGitHub: vi.fn(() => Promise.resolve([])),
@@ -176,6 +177,20 @@ describe('Player', () => {
         expect(player.queue[2].id).toBe(3);
     });
 
+    test('enableRadio can prefill the queue with provided recommendations', async () => {
+        player = new Player(audioElement, api);
+        player.wipeQueue = vi.fn().mockResolvedValue();
+        player.setQueue = vi.fn().mockResolvedValue();
+        player.playAtIndex = vi.fn().mockResolvedValue();
+
+        const tracks = [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }, { id: 6 }];
+
+        await player.enableRadio(tracks, { prefillQueue: true });
+
+        expect(player.setQueue).toHaveBeenCalledWith(tracks, 0, true);
+        expect(player.playAtIndex).toHaveBeenCalledWith(0);
+    });
+
     test('clearQueue resets queue state', async () => {
         player = new Player(audioElement, api);
         player.queue = [{ id: 1 }];
@@ -218,6 +233,104 @@ describe('Player', () => {
         expect(badge.textContent).toContain('192 kHz');
         expect(badge.textContent).toContain('1012 kbps');
         expect(badge.title).toContain('qobuz');
+    });
+
+    test('fetchBlobWithProgress retries remote streams through audio proxy after fetch failure', async () => {
+        player = new Player(audioElement, api);
+        const blob = new Blob(['audio']);
+        globalThis.fetch = vi
+            .fn()
+            .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+            .mockResolvedValueOnce({
+                ok: true,
+                headers: new Headers({ 'content-type': 'audio/mp4' }),
+                blob: vi.fn().mockResolvedValue(blob),
+            });
+
+        const result = await player.fetchBlobWithProgress('https://invidious.example/latest_version?id=abc123');
+
+        expect(globalThis.fetch).toHaveBeenNthCalledWith(1, 'https://invidious.example/latest_version?id=abc123', {
+            signal: undefined,
+        });
+        expect(globalThis.fetch).toHaveBeenNthCalledWith(
+            2,
+            '/proxy-audio?url=https%3A%2F%2Finvidious.example%2Flatest_version%3Fid%3Dabc123',
+            { signal: undefined }
+        );
+        expect(result).toBe(blob);
+    });
+
+    test('does not fetch legacy track metadata for youtube source streams during playback startup', async () => {
+        player = new Player(audioElement, api);
+        const playPromise = Promise.resolve();
+        audioElement.play = vi.fn(() => playPromise);
+        audioElement.load = vi.fn();
+        Object.defineProperty(audioElement, 'paused', { configurable: true, get: () => false });
+        Object.defineProperty(audioElement, 'readyState', { configurable: true, get: () => 4 });
+        Object.defineProperty(audioElement, 'error', { configurable: true, get: () => null });
+
+        player.queue = [{ id: 'abc123def45', title: 'Around the World', artist: { name: 'Daft Punk' } }];
+        player.currentQueueIndex = 0;
+        player.waitForCanPlayOrTimeout = vi.fn().mockResolvedValue(true);
+        player.preloadNextTracks = vi.fn();
+        player.cleanupRetiredBlobPlaybackUrls = vi.fn();
+        player.fetchBlobWithProgress = vi.fn().mockResolvedValue(new Blob(['audio']));
+
+        api.getPlayableStreamInfo = vi.fn().mockResolvedValue({
+            url: 'https://example.com/audio.m4a',
+            rgInfo: null,
+            isYoutubeFallback: true,
+            fallbackSource: 'youtube-music',
+            forceBlobPlayback: true,
+        });
+        api.getTrack = vi.fn();
+
+        await player.playTrackFromQueue(0, 0);
+
+        expect(api.getTrack).not.toHaveBeenCalled();
+        expect(api.getPlayableStreamInfo).toHaveBeenCalled();
+    });
+
+    test('starts direct stream playback without waiting for canplay first', async () => {
+        player = new Player(audioElement, api);
+        const calls = [];
+
+        audioElement.play = vi.fn(() => {
+            calls.push('play');
+            return Promise.resolve();
+        });
+        audioElement.load = vi.fn(() => {
+            calls.push('load');
+        });
+        Object.defineProperty(audioElement, 'paused', { configurable: true, get: () => false });
+        Object.defineProperty(audioElement, 'readyState', { configurable: true, get: () => 1 });
+        Object.defineProperty(audioElement, 'error', { configurable: true, get: () => null });
+
+        player.waitForCanPlayOrTimeout = vi.fn().mockResolvedValue(true);
+        player.waitForPlaybackStartOrReady = vi.fn().mockResolvedValue(true);
+
+        const played = await player.startDirectPlayback(audioElement, 'https://example.com/audio.m4a');
+
+        expect(played).toBe(true);
+        expect(audioElement.load).toHaveBeenCalled();
+        expect(audioElement.play).toHaveBeenCalled();
+        expect(player.waitForCanPlayOrTimeout).not.toHaveBeenCalled();
+        expect(calls).toEqual(['load', 'play']);
+    });
+
+    test('deduplicates concurrent stream info lookups for playback', async () => {
+        player = new Player(audioElement, api);
+        api.getPlayableStreamInfo = vi.fn().mockResolvedValue({ url: 'https://example.com/audio.m4a' });
+
+        const track = { id: 'track-1', title: 'Track 1' };
+        const [first, second] = await Promise.all([
+            player.getStreamInfoForPlayback(track, 'LOSSLESS'),
+            player.getStreamInfoForPlayback(track, 'LOSSLESS'),
+        ]);
+
+        expect(first).toEqual({ url: 'https://example.com/audio.m4a', resolvedAt: expect.any(Number) });
+        expect(second).toBe(first);
+        expect(api.getPlayableStreamInfo).toHaveBeenCalledTimes(1);
     });
 
     test('treats expiring preloaded stream URLs as stale', () => {

@@ -12,6 +12,7 @@ describe('LosslessAPI YouTube fallback', () => {
             refreshInstances: vi.fn(),
         });
         api.getStreamUrl = vi.fn();
+        api.fetchLocalYouTubeMusicBridge = vi.fn().mockRejectedValue(new Error('bridge unavailable'));
     });
 
     test('falls back to YouTube audio when the primary source cannot resolve a stream', async () => {
@@ -67,6 +68,17 @@ describe('LosslessAPI YouTube fallback', () => {
         expect(format.url).toBe('https://example.com/audio.m4a');
     });
 
+    test('parses YouTube Music duration strings', () => {
+        const track = api.normalizeYouTubeMusicTrack({
+            videoId: 'abc123def45',
+            title: 'Digital Love',
+            author: 'Daft Punk',
+            duration: '3:44',
+        });
+
+        expect(track.duration).toBe(224);
+    });
+
     test('searches YouTube Music when selected as the music source', async () => {
         musicSourceSettings.setSource('youtube-music');
         api.getYouTubeFallbackInstances = vi.fn().mockResolvedValue(['https://invidious.example']);
@@ -120,8 +132,42 @@ describe('LosslessAPI YouTube fallback', () => {
         expect(fetch).toHaveBeenCalledWith('https://invidious.example/api/v1/videos/abc123', {
             signal: undefined,
         });
-        expect(result.url).toBe('https://invidious.example/latest_version?id=abc123&itag=140&local=false');
+        expect(result.url).toBe('https://example.com/audio.m4a');
         expect(result.fallbackSource).toBe('youtube-music');
+        expect(result.forceBlobPlayback).toBe(false);
+    });
+
+    test('falls back to Invidious latest_version when direct YouTube audio URL is not fetchable', async () => {
+        musicSourceSettings.setSource('youtube-music');
+        api.getStreamUrl = LosslessAPI.prototype.getStreamUrl.bind(api);
+        api.getYouTubeFallbackInstances = vi.fn().mockResolvedValue(['https://invidious.example']);
+        api.validateAudioStreamUrl = vi
+            .fn()
+            .mockResolvedValueOnce(false)
+            .mockResolvedValueOnce(true);
+        globalThis.fetch = vi.fn().mockResolvedValue({
+            ok: true,
+            json: vi.fn().mockResolvedValue({
+                adaptiveFormats: [
+                    {
+                        type: 'audio/mp4; codecs="mp4a.40.2"',
+                        bitrate: '128000',
+                        itag: '140',
+                        url: 'https://example.com/audio.m4a',
+                    },
+                ],
+            }),
+        });
+
+        const result = await api.getStreamUrl('abc123');
+
+        expect(api.validateAudioStreamUrl).toHaveBeenCalledWith('https://example.com/audio.m4a', {});
+        expect(api.validateAudioStreamUrl).toHaveBeenCalledWith(
+            'https://invidious.example/latest_version?id=abc123&itag=140&local=true',
+            {}
+        );
+        expect(result.url).toBe('https://invidious.example/latest_version?id=abc123&itag=140&local=true');
+        expect(result.forceBlobPlayback).toBe(false);
     });
 
     test('uses YouTube result video ids directly during selected source playback', async () => {
@@ -145,6 +191,74 @@ describe('LosslessAPI YouTube fallback', () => {
         expect(api.getYouTubeMusicSourceStreamUrl).toHaveBeenCalledWith('abc123def45', {});
         expect(api.getYouTubeFallbackStreamUrl).not.toHaveBeenCalled();
         expect(result.fallbackSource).toBe('youtube-music');
+    });
+
+    test('resolves YouTube recommendations through the selected source when another source is selected', async () => {
+        musicSourceSettings.setSource('tidal');
+        api.searchTracks = vi.fn().mockResolvedValue({
+            items: [
+                {
+                    id: 'bad-match',
+                    title: 'Digital Love',
+                    artist: { name: 'Daft Punk' },
+                    duration: 301,
+                },
+                {
+                    id: 'tidal-match',
+                    title: 'Around the World',
+                    artist: { name: 'Daft Punk' },
+                    duration: 242,
+                },
+            ],
+        });
+        api.getStreamUrl = vi.fn().mockResolvedValue({
+            url: 'https://audio.tidal.example/tidal-match.flac',
+            rgInfo: null,
+        });
+        api.getYouTubeMusicSourceStreamUrl = vi.fn();
+
+        const result = await api.getPlayableStreamInfo({
+            id: 'abc123def45',
+            youtubeVideoId: 'abc123def45',
+            title: 'Around the World',
+            artist: { name: 'Daft Punk' },
+            duration: 240,
+            source: 'youtube-music',
+        });
+
+        expect(api.searchTracks).toHaveBeenCalledWith('Around the World Daft Punk', { signal: undefined });
+        expect(api.getStreamUrl).toHaveBeenCalledWith('tidal-match', 'LOSSLESS', undefined);
+        expect(api.getYouTubeMusicSourceStreamUrl).not.toHaveBeenCalled();
+        expect(result.url).toBe('https://audio.tidal.example/tidal-match.flac');
+    });
+
+    test('caches converted YouTube recommendation ids for the selected source', async () => {
+        musicSourceSettings.setSource('tidal');
+        const youtubeTrack = {
+            id: 'abc123def45',
+            youtubeVideoId: 'abc123def45',
+            title: 'Around the World',
+            artist: { name: 'Daft Punk' },
+            duration: 240,
+            source: 'youtube-music',
+        };
+        api.searchTracks = vi.fn().mockResolvedValue({
+            items: [
+                {
+                    id: 'tidal-match',
+                    title: 'Around the World',
+                    artist: { name: 'Daft Punk' },
+                    duration: 242,
+                },
+            ],
+        });
+
+        const first = await api.convertYouTubeRecommendationToSelectedSourceTrack(youtubeTrack);
+        const second = await api.convertYouTubeRecommendationToSelectedSourceTrack(youtubeTrack);
+
+        expect(api.searchTracks).toHaveBeenCalledTimes(1);
+        expect(first.id).toBe('tidal-match');
+        expect(second.id).toBe('tidal-match');
     });
 
     test('searches YouTube by metadata when selected source playback gets a non-YouTube track id', async () => {
@@ -193,14 +307,38 @@ describe('LosslessAPI YouTube fallback', () => {
 
         const result = await api.getPlayableStreamInfo(track, 'LOSSLESS');
 
-        expect(api.searchManifestSource).toHaveBeenCalled();
         expect(api.getManifestSourceStreamUrl).toHaveBeenCalledWith(
-            'hifi_1550546',
+            '1550546',
             {},
             expect.objectContaining({ id: expect.any(String), baseUrl: expect.any(String) })
         );
+        expect(api.getManifestSourceStreamUrl.mock.calls[0][2].id).toBe('all-in-one');
+        expect(api.searchManifestSource).not.toHaveBeenCalled();
         expect(api.getYouTubeFallbackStreamUrl).not.toHaveBeenCalled();
         expect(result.url).toBe('https://amz-pr-fa.audio.tidal.com/audio.mp4');
+    });
+
+    test('skips selected addon probing for cross-source all-in-one track ids', async () => {
+        musicSourceSettings.setSource('spotiflac');
+        const track = {
+            id: 'hifi_instance_1550546',
+            title: 'One More Time',
+            artist: { name: 'Daft Punk' },
+            manifestSourceId: 'spotiflac',
+        };
+
+        api.getStreamUrl = vi.fn();
+        api.getManifestSourceStreamUrl = vi.fn().mockResolvedValue({
+            url: 'https://streaming-qobuz-std.akamaized.net/file?uid=1',
+            manifestSourceId: 'all-in-one',
+        });
+
+        const result = await api.getPlayableStreamInfo(track, 'LOSSLESS');
+
+        expect(api.getStreamUrl).not.toHaveBeenCalled();
+        expect(api.getManifestSourceStreamUrl.mock.calls[0][0]).toBe('hifi_instance_1550546');
+        expect(api.getManifestSourceStreamUrl.mock.calls[0][2].id).toBe('all-in-one');
+        expect(result.url).toBe('https://streaming-qobuz-std.akamaized.net/file?uid=1');
     });
 
     test('does not force blob playback for direct TIDAL MP4 addon streams', async () => {
@@ -237,5 +375,57 @@ describe('LosslessAPI YouTube fallback', () => {
 
         expect(result.url).toBe('https://streaming-qobuz-std.akamaized.net/file?uid=1');
         expect(result.forceBlobPlayback).toBe(false);
+    });
+
+    test('fills playlist recommendations from YouTube Music when TIDAL recommendations are short', async () => {
+        musicSourceSettings.setSource('tidal');
+        const seed = {
+            id: 'seedVideo1x',
+            youtubeVideoId: 'seedVideo1x',
+            title: 'Around the World',
+            artist: { id: 'daft-punk', name: 'Daft Punk' },
+        };
+        api.getArtist = vi.fn().mockResolvedValue({ tracks: [] });
+        api.getYouTubeFallbackInstances = vi.fn().mockResolvedValue(['https://invidious.example']);
+        api.searchYouTubeMusicSource = vi.fn().mockResolvedValue({
+            tracks: {
+                items: [
+                    {
+                        id: 'query-result',
+                        youtubeVideoId: 'query-result',
+                        title: 'Digital Love',
+                        artist: { name: 'Daft Punk' },
+                        source: 'youtube-music',
+                    },
+                ],
+            },
+        });
+        globalThis.fetch = vi.fn().mockResolvedValue({
+            ok: true,
+            json: vi.fn().mockResolvedValue({
+                recommendedVideos: [
+                    {
+                        id: 'same-song',
+                        videoId: 'same-song',
+                        title: 'Around the World (Official Audio)',
+                        author: 'Daft Punk',
+                    },
+                    {
+                        videoId: 'abc123def45',
+                        title: 'One More Time',
+                        author: 'Daft Punk',
+                    },
+                ],
+            }),
+        });
+
+        const result = await api.getRecommendedTracksForPlaylist([seed], 5);
+
+        expect(fetch).toHaveBeenCalledWith('https://invidious.example/api/v1/videos/seedVideo1x', {
+            signal: undefined,
+        });
+        expect(result[0].id).toBe('abc123def45');
+        expect(result[1].id).toBe('query-result');
+        expect(result[0].source).toBe('youtube-music');
     });
 });

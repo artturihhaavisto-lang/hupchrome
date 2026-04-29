@@ -20,6 +20,7 @@ import {
     binauralDspSettings,
     contentBlockingSettings,
     qualityBadgeSettings,
+    musicSourceSettings,
 } from './storage.js';
 import { audioContextManager } from './audio-context.js';
 import { isIos, isSafari } from './platform-detection.js';
@@ -53,6 +54,7 @@ export class Player {
         this.shuffleActive = false;
         this.repeatMode = REPEAT_MODE.OFF;
         this.preloadCache = new Map();
+        this.streamInfoPromiseCache = new Map();
         this.blobPlaybackUrls = new Map();
         this.retiredBlobPlaybackUrls = new Map();
         this._pendingPreload = false;
@@ -93,6 +95,13 @@ export class Player {
             percent: null,
             label: '',
         };
+
+        this.audio.preload = 'auto';
+        this.audio.crossOrigin = 'anonymous';
+        if (this.video) {
+            this.video.preload = 'auto';
+            this.video.crossOrigin = 'anonymous';
+        }
     }
 
     static async initialize(audioElement, api, quality) {
@@ -429,18 +438,39 @@ export class Player {
     }
 
     async fetchBlobWithProgress(url, { signal, label = 'Downloading...', onProgress } = {}) {
+        const buildProxyUrl = (candidateUrl) => {
+            if (!candidateUrl || typeof candidateUrl !== 'string') return null;
+            if (candidateUrl.startsWith('blob:')) return null;
+            const isLocalDev =
+                typeof window !== 'undefined' &&
+                (window.location.hostname === '127.0.0.1' || window.location.hostname === 'localhost');
+            if (candidateUrl.startsWith('/proxy-audio?')) return candidateUrl;
+            if (candidateUrl.startsWith('https://audio-proxy.binimum.org/')) return null;
+            if (isLocalDev) {
+                return `/proxy-audio?url=${encodeURIComponent(candidateUrl)}`;
+            }
+            return `https://audio-proxy.binimum.org/proxy-audio?url=${encodeURIComponent(candidateUrl)}`;
+        };
+
         const directUrl = url;
-        let response = await fetch(directUrl, { signal });
-        if (
-            !response.ok &&
-            response.status === 403 &&
-            typeof directUrl === 'string' &&
-            (directUrl.includes('amz-pr-fa.audio.tidal.com') || directUrl.includes('.audio.tidal.com'))
-        ) {
-            response = await fetch(getProxyUrl(directUrl), { signal });
+        const proxyUrl = buildProxyUrl(directUrl);
+        let response = null;
+        let lastError = null;
+
+        for (const candidateUrl of [directUrl, proxyUrl].filter(Boolean)) {
+            try {
+                response = await fetch(candidateUrl, { signal });
+                if (response.ok) break;
+                lastError = new Error(`HTTP ${response.status}`);
+            } catch (error) {
+                if (error.name === 'AbortError') throw error;
+                lastError = error;
+                response = null;
+            }
         }
-        if (!response.ok) {
-            throw new Error(`Failed to fetch stream: HTTP ${response.status}`);
+
+        if (!response?.ok) {
+            throw new Error(`Failed to fetch stream: ${lastError?.message || 'unknown error'}`);
         }
 
         const contentType = response.headers.get('content-type') || '';
@@ -522,7 +552,40 @@ export class Player {
         const titleEl = document.querySelector('.now-playing-bar .title');
         if (!titleEl) return;
 
-        titleEl.innerHTML = `${escapeHtml(getTrackTitle(track))} ${createQualityBadgeHTML(track)} ${this.createStreamQualityBadgeHTML(track)}`;
+        titleEl.innerHTML = `<span class="now-playing-title-text">${escapeHtml(getTrackTitle(track))}</span>${createQualityBadgeHTML(track)}${this.createStreamQualityBadgeHTML(track)}`;
+    }
+
+    resolvePlaybackProviderLabel(track, streamInfo = track?.streamInfo || track?.currentStreamInfo) {
+        const providerId =
+            streamInfo?.source || streamInfo?.manifestSourceId || streamInfo?.fallbackSource || track?.manifestSourceId;
+        if (!providerId) return '';
+
+        const configuredSource = musicSourceSettings.getSourceConfig(providerId);
+        if (configuredSource?.id === providerId && configuredSource?.name) {
+            return configuredSource.name;
+        }
+
+        if (providerId === 'youtube-music') return 'YouTube Music';
+        if (providerId === 'tidal') return 'TIDAL / Monochrome';
+        return String(providerId);
+    }
+
+    updateNowPlayingAlbumLine(track) {
+        const albumEl = document.querySelector('.now-playing-bar .album');
+        if (!albumEl) return;
+
+        const providerLabel = this.resolvePlaybackProviderLabel(track);
+        const trackTitle = getTrackTitle(track);
+        const albumTitle = track.album?.title || '';
+        const display = providerLabel || (albumTitle && albumTitle !== trackTitle ? albumTitle : '');
+
+        if (display) {
+            albumEl.textContent = display;
+            albumEl.style.display = 'block';
+        } else {
+            albumEl.textContent = '';
+            albumEl.style.display = 'none';
+        }
     }
 
     createStreamQualityBadgeHTML(track) {
@@ -654,7 +717,6 @@ export class Player {
                 const yearDisplay = getTrackYearDisplay(track);
 
                 const coverEl = document.querySelector('.now-playing-bar .cover');
-                const albumEl = document.querySelector('.now-playing-bar .album');
                 const artistEl = document.querySelector('.now-playing-bar .artist');
 
                 if (coverEl) {
@@ -701,16 +763,7 @@ export class Player {
                     }
                 }
                 this.updateNowPlayingTitle(track);
-                if (albumEl) {
-                    const albumTitle = track.album?.title || '';
-                    if (albumTitle && albumTitle !== trackTitle) {
-                        albumEl.textContent = albumTitle;
-                        albumEl.style.display = 'block';
-                    } else {
-                        albumEl.textContent = '';
-                        albumEl.style.display = 'none';
-                    }
-                }
+                this.updateNowPlayingAlbumLine(track);
                 if (artistEl) artistEl.innerHTML = trackArtistsHTML + yearDisplay;
 
                 // Fetch album release date in background if missing
@@ -845,6 +898,52 @@ export class Player {
         return streamInfo.expiresAt > Date.now() / 1000 + 30;
     }
 
+    getStreamInfoCacheKey(track, quality = this.quality) {
+        const id = track?.id ?? track;
+        return `${id || 'unknown'}::${quality || ''}`;
+    }
+
+    getStreamInfoForPlayback(track, quality = this.quality, options = {}) {
+        if (typeof this.api?.getPlayableStreamInfo !== 'function') {
+            return Promise.reject(new Error('Playable stream API is unavailable'));
+        }
+
+        const key = this.getStreamInfoCacheKey(track, quality);
+        if (this.streamInfoPromiseCache.has(key)) {
+            return this.streamInfoPromiseCache.get(key);
+        }
+
+        const promise = this.api
+            .getPlayableStreamInfo(track, quality, options)
+            .then((streamInfo) => {
+                if (streamInfo) {
+                    streamInfo.resolvedAt = streamInfo.resolvedAt || Date.now();
+                }
+                return streamInfo;
+            })
+            .finally(() => {
+                this.streamInfoPromiseCache.delete(key);
+            });
+
+        this.streamInfoPromiseCache.set(key, promise);
+        return promise;
+    }
+
+    warmStreamInfoForTrack(track, quality = this.quality, options = {}) {
+        if (typeof this.api?.getPlayableStreamInfo !== 'function') return null;
+        if (!track || track.isLocal || track.type === 'video') return null;
+        const isTracker = track.isTracker || (track.id && String(track.id).startsWith('tracker-'));
+        const isPodcast = track.isPodcast || (track.id && String(track.id).startsWith('podcast_'));
+        if (isTracker || isPodcast || (track.audioUrl && !track.isLocal)) return null;
+
+        return this.getStreamInfoForPlayback(track, quality, options).catch((error) => {
+            if (error?.name !== 'AbortError') {
+                console.warn('Failed to warm stream info:', error);
+            }
+            throw error;
+        });
+    }
+
     async resolveFreshStreamInfo(track, quality = this.quality) {
         this.releasePreloadEntry(track.id);
         if (typeof this.api.invalidateStreamCache === 'function') {
@@ -890,6 +989,7 @@ export class Player {
     }
 
     clearPreloadAndBlobCaches() {
+        this.streamInfoPromiseCache.clear();
         for (const trackId of this.preloadCache.keys()) {
             this.releasePreloadEntry(trackId);
         }
@@ -1406,6 +1506,7 @@ export class Player {
         const previousActiveElement = this.activeElement;
         const shouldPreserveGestureToken =
             preserveGestureToken && previousActiveElement === this.audio && track.type !== 'video';
+        const warmedStreamInfoPromise = this.warmStreamInfoForTrack(track, this.quality);
 
         // Proactively fetch more artist tracks when the last track starts playing
         console.log('[playTrackFromQueue] Check for fetch:', {
@@ -1558,17 +1659,7 @@ export class Player {
             }
         }
         this.updateNowPlayingTitle(track);
-        const albumEl = document.querySelector('.now-playing-bar .album');
-        if (albumEl) {
-            const albumTitle = track.album?.title || '';
-            if (albumTitle && albumTitle !== trackTitle) {
-                albumEl.textContent = albumTitle;
-                albumEl.style.display = 'block';
-            } else {
-                albumEl.textContent = '';
-                albumEl.style.display = 'none';
-            }
-        }
+        this.updateNowPlayingAlbumLine(track);
         const artistEl = document.querySelector('.now-playing-bar .artist');
         artistEl.innerHTML = trackArtistsHTML + yearDisplay;
 
@@ -1607,17 +1698,11 @@ export class Player {
                 this.currentRgValues = null;
                 this.applyReplayGain();
 
-                activeElement.src = streamUrl;
-                this.applyAudioEffects();
-
-                const canPlay = await this.waitForCanPlayOrTimeout(activeElement);
-                if (!canPlay || this.playbackSequence !== currentSequence) return;
-
-                if (startTime > 0) {
-                    activeElement.currentTime = startTime;
-                }
-                const played = await this.safePlay(activeElement);
-                if (played) this.hidePlaybackLoadProgress();
+                const played = await this.startDirectPlayback(activeElement, streamUrl, {
+                    startTime,
+                    useProxy: false,
+                });
+                if (this.playbackSequence !== currentSequence) return;
                 if (!played) return;
             } else if (isTracker || (track.audioUrl && !track.isLocal)) {
                 streamUrl = track.audioUrl;
@@ -1659,18 +1744,11 @@ export class Player {
                 this.currentRgValues = null;
                 this.applyReplayGain();
 
-                activeElement.src = streamUrl;
-                this.applyAudioEffects();
-
-                // Wait for audio to be ready before playing (prevents restart issues with blob URLs)
-                const canPlay = await this.waitForCanPlayOrTimeout(activeElement);
-                if (!canPlay || this.playbackSequence !== currentSequence) return;
-
-                if (startTime > 0) {
-                    activeElement.currentTime = startTime;
-                }
-                const played = await this.safePlay(activeElement);
-                if (played) this.hidePlaybackLoadProgress();
+                const played = await this.startDirectPlayback(activeElement, streamUrl, {
+                    startTime,
+                    useProxy: false,
+                });
+                if (this.playbackSequence !== currentSequence) return;
                 if (!played) return;
             } else if (track.isLocal && track.file) {
                 streamUrl = URL.createObjectURL(track.file);
@@ -1679,18 +1757,11 @@ export class Player {
                 this.currentRgValues = null; // No replaygain for local files yet
                 this.applyReplayGain();
 
-                activeElement.src = streamUrl;
-                this.applyAudioEffects();
-
-                // Wait for audio to be ready before playing
-                const canPlay = await this.waitForCanPlayOrTimeout(activeElement);
-                if (!canPlay || this.playbackSequence !== currentSequence) return;
-
-                if (startTime > 0) {
-                    activeElement.currentTime = startTime;
-                }
-                const played = await this.safePlay(activeElement);
-                if (played) this.hidePlaybackLoadProgress();
+                const played = await this.startDirectPlayback(activeElement, streamUrl, {
+                    startTime,
+                    useProxy: false,
+                });
+                if (this.playbackSequence !== currentSequence) return;
                 if (!played) return;
             } else if (track.type === 'video') {
                 if (UIRenderer.instance) {
@@ -1769,7 +1840,7 @@ export class Player {
                 const streamInfoPromise =
                     preloadedStreamInfo && this.isStreamInfoFresh(preloadedStreamInfo)
                         ? Promise.resolve(preloadedStreamInfo)
-                        : this.api.getPlayableStreamInfo(track, this.quality);
+                        : warmedStreamInfoPromise || this.getStreamInfoForPlayback(track, this.quality);
 
                 // We only need the legacy track info if we missed getting ReplayGain from the manifest endpoint
                 const resolvedStreamInfo = await streamInfoPromise;
@@ -1778,6 +1849,7 @@ export class Player {
                 streamUrl = resolvedStreamInfo.url;
                 track.isYoutubeFallbackStream = !!resolvedStreamInfo.isYoutubeFallback;
                 this.attachStreamInfoToTrack(track, resolvedStreamInfo, currentSequence);
+                this.updateNowPlayingAlbumLine(track);
                 if (resolvedStreamInfo.blobPlayback && streamUrl?.startsWith('blob:')) {
                     this.blobPlaybackUrls.set(track.id, streamUrl);
                 }
@@ -1798,11 +1870,18 @@ export class Player {
                     this.blobPlaybackUrls.set(track.id, streamUrl);
                 }
 
+                const isYouTubeSourceStream =
+                    resolvedStreamInfo.fallbackSource === 'youtube-music' ||
+                    resolvedStreamInfo.isYoutubeFallback;
+
                 if (resolvedStreamInfo.rgInfo) {
                     this.currentRgValues = resolvedStreamInfo.rgInfo;
                     this.applyReplayGain();
                 } else if (resolvedStreamInfo.rgInfoFallback) {
                     this.currentRgValues = resolvedStreamInfo.rgInfoFallback;
+                    this.applyReplayGain();
+                } else if (isYouTubeSourceStream) {
+                    this.currentRgValues = null;
                     this.applyReplayGain();
                 } else {
                     // Fallback to legacy metadata if manifest lacked normalization data
@@ -1870,14 +1949,25 @@ export class Player {
                         } catch {}
                         this.shakaInitialized = false;
                     }
+                    activeElement.preload = 'auto';
+                    if (activeElement.crossOrigin !== 'anonymous') {
+                        activeElement.crossOrigin = 'anonymous';
+                    }
                     activeElement.src = getProxyUrl(streamUrl);
+                    if (typeof activeElement.load === 'function') {
+                        activeElement.load();
+                    }
                     this.applyAudioEffects();
                     this.updateAdaptiveQualityBadge();
 
                     if (startTime > 0) {
+                        await this.waitForLoadedMetadataOrTimeout(activeElement).catch(() => false);
                         activeElement.currentTime = startTime;
                     }
-                    let canPlay = await this.waitForCanPlayOrTimeout(activeElement).catch(() => false);
+                    let played = await this.safePlay(activeElement);
+                    let canPlay = played
+                        ? await this.waitForPlaybackStartOrReady(activeElement).catch(() => false)
+                        : false;
                     if ((!canPlay || activeElement.error) && this.playbackSequence === currentSequence) {
                         try {
                             const freshStreamInfo = await this.resolveFreshStreamInfo(track, this.quality);
@@ -1887,10 +1977,15 @@ export class Player {
                             activeElement.removeAttribute('src');
                             activeElement.load();
                             activeElement.src = getProxyUrl(streamUrl);
+                            activeElement.load();
                             if (startTime > 0) {
+                                await this.waitForLoadedMetadataOrTimeout(activeElement).catch(() => false);
                                 activeElement.currentTime = startTime;
                             }
-                            canPlay = await this.waitForCanPlayOrTimeout(activeElement).catch(() => false);
+                            played = await this.safePlay(activeElement);
+                            canPlay = played
+                                ? await this.waitForPlaybackStartOrReady(activeElement).catch(() => false)
+                                : false;
                         } catch (refreshError) {
                             console.warn('Failed to refresh stream URL after playback load failure:', refreshError);
                         }
@@ -1908,7 +2003,6 @@ export class Player {
                         return;
                     }
                     if (this.playbackSequence !== currentSequence) return;
-                    const played = await this.safePlay(activeElement);
                     if (!played && this.playbackSequence === currentSequence) {
                         const playedFromBlob = await this.fallbackToBlobPlayback(
                             streamUrl,
@@ -2070,9 +2164,10 @@ export class Player {
         }
     }
 
-    async enableRadio(seeds = []) {
+    async enableRadio(seeds = [], options = {}) {
         this.radioEnabled = true;
         radioSettings.setEnabled(true);
+        const prefillQueue = options.prefillQueue === true;
 
         if (seeds.length === 0) {
             await this.wipeQueue();
@@ -2086,7 +2181,11 @@ export class Player {
         } else {
             this.radioSeeds = Array.isArray(seeds) ? seeds : [seeds];
             await this.wipeQueue();
-            const initialQueue = Array.isArray(seeds) ? seeds.slice(0, 5) : [seeds];
+            const initialQueue = Array.isArray(seeds)
+                ? prefillQueue
+                    ? [...seeds]
+                    : seeds.slice(0, 5)
+                : [seeds];
             await this.setQueue(initialQueue, 0, true);
             await this.playAtIndex(0);
         }
@@ -3051,6 +3150,9 @@ export class Player {
 
     async safePlay(element = this.activeElement) {
         try {
+            if (audioContextManager.isReady()) {
+                await audioContextManager.resume();
+            }
             await element.play();
             this.autoplayBlocked = false;
             return true;
@@ -3061,6 +3163,104 @@ export class Player {
             }
             throw error;
         }
+    }
+
+    async waitForPlaybackStartOrReady(element = this.activeElement, timeoutMs = 3500) {
+        if (!element) return false;
+        if (!element.paused || element.readyState >= 2) return true;
+
+        return await new Promise((resolve, reject) => {
+            let settled = false;
+            let timeoutId;
+
+            const cleanup = () => {
+                element.removeEventListener('playing', onReady);
+                element.removeEventListener('canplay', onReady);
+                element.removeEventListener('timeupdate', onReady);
+                element.removeEventListener('error', onError);
+                if (timeoutId) clearTimeout(timeoutId);
+            };
+            const finish = (value) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve(value);
+            };
+            const onReady = () => finish(true);
+            const onError = (event) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(event);
+            };
+
+            element.addEventListener('playing', onReady, { once: true });
+            element.addEventListener('canplay', onReady, { once: true });
+            element.addEventListener('timeupdate', onReady, { once: true });
+            element.addEventListener('error', onError, { once: true });
+            timeoutId = setTimeout(() => finish(!element.error), timeoutMs);
+        });
+    }
+
+    async waitForLoadedMetadataOrTimeout(element = this.activeElement, timeoutMs = 3000) {
+        if (!element || element.readyState >= 1) return true;
+
+        return await new Promise((resolve, reject) => {
+            let settled = false;
+            let timeoutId;
+
+            const cleanup = () => {
+                element.removeEventListener('loadedmetadata', onReady);
+                element.removeEventListener('durationchange', onReady);
+                element.removeEventListener('error', onError);
+                if (timeoutId) clearTimeout(timeoutId);
+            };
+            const finish = (value) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve(value);
+            };
+            const onReady = () => finish(true);
+            const onError = (event) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(event);
+            };
+
+            element.addEventListener('loadedmetadata', onReady, { once: true });
+            element.addEventListener('durationchange', onReady, { once: true });
+            element.addEventListener('error', onError, { once: true });
+            timeoutId = setTimeout(() => finish(false), timeoutMs);
+        });
+    }
+
+    async startDirectPlayback(element, streamUrl, { startTime = 0, useProxy = true } = {}) {
+        element.preload = 'auto';
+        if (element.crossOrigin !== 'anonymous') {
+            element.crossOrigin = 'anonymous';
+        }
+        element.src = useProxy ? getProxyUrl(streamUrl) : streamUrl;
+        if (typeof element.load === 'function') {
+            element.load();
+        }
+        this.applyAudioEffects();
+
+        if (startTime > 0) {
+            await this.waitForLoadedMetadataOrTimeout(element).catch(() => false);
+            element.currentTime = startTime;
+        }
+
+        const played = await this.safePlay(element);
+        if (!played) return false;
+
+        await this.waitForPlaybackStartOrReady(element).catch((error) => {
+            if (element.error) throw error;
+            return false;
+        });
+        this.hidePlaybackLoadProgress();
+        return true;
     }
 
     async waitForCanPlayOrTimeout(element = this.activeElement, timeoutMs = 10000) {

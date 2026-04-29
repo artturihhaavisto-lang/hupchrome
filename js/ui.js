@@ -865,7 +865,6 @@ export class UIRenderer {
     createArtistCardHTML(artist) {
         const isCompact = cardSettings.isCompactArtist();
         const isBlocked = contentBlockingSettings?.shouldHideArtist(artist);
-
         return this.createBaseCardHTML({
             type: 'artist',
             id: artist.id,
@@ -3056,7 +3055,7 @@ export class UIRenderer {
 
         if (!homePageSettings.shouldShowRecommendedSongs()) {
             if (section) section.style.display = 'none';
-            return;
+            return [];
         }
 
         if (section) section.style.display = '';
@@ -3082,9 +3081,15 @@ export class UIRenderer {
                     ...history.map((t) => t.id),
                 ]);
 
-                let recommendedTracks = await this.api.getRecommendedTracksForPlaylist(seeds, 20, {
+                const recommendationSignal =
+                    typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+                        ? AbortSignal.timeout(12000)
+                        : undefined;
+
+                let recommendedTracks = await this.api.getYouTubeMusicRecommendations(seeds, 20, {
                     skipCache: forceRefresh,
                     knownTrackIds: knownTrackIds,
+                    signal: recommendationSignal,
                 });
 
                 try {
@@ -3106,11 +3111,16 @@ export class UIRenderer {
                 } else {
                     songsContainer.innerHTML = createPlaceholder('No song recommendations found.');
                 }
+                return filteredTracks;
             } catch (e) {
                 console.error(e);
+                this.lastRecommendedTracks = [];
                 songsContainer.innerHTML = createPlaceholder('Failed to load song recommendations.');
+                return [];
             }
         }
+
+        return [];
     }
 
     async renderHomeAlbums(forceRefresh = false, providedSeeds = null, retryCount = 0) {
@@ -4972,7 +4982,32 @@ export class UIRenderer {
         if (toggleBtn) toggleBtn.setAttribute('aria-expanded', 'false');
 
         try {
-            const artist = await this.api.getArtist(artistId, provider);
+            let resolvedArtistId = artistId;
+            if (typeof artistId === 'string' && !/^\d+$/.test(artistId)) {
+                const queue = this.player?.queue || [];
+                const current = this.player?.currentTrack;
+                const queryName =
+                    (current?.artist?.id === artistId && current?.artist?.name) ||
+                    (current?.artists || []).find((a) => a?.id === artistId)?.name ||
+                    queue.find((t) => t?.artist?.id === artistId)?.artist?.name ||
+                    queue
+                        .flatMap((t) => t?.artists || [])
+                        .find((a) => a?.id === artistId)?.name ||
+                    '';
+                if (queryName) {
+                    const search = await this.api.searchArtists(queryName);
+                    const candidates = search?.items || [];
+                    const exact = candidates.find(
+                        (a) => String((a?.name || '').trim()).toLowerCase() === queryName.trim().toLowerCase()
+                    );
+                    const picked = exact || candidates[0];
+                    if (picked?.id && /^\d+$/.test(String(picked.id))) {
+                        resolvedArtistId = picked.id;
+                    }
+                }
+            }
+
+            const artist = await this.api.getArtist(resolvedArtistId, provider);
 
             const currentId = this.currentArtistId;
             this.api

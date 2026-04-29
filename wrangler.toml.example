@@ -1,0 +1,7 @@
+name = "monochrome"
+pages_build_output_dir = "dist"
+
+[[d1_databases]]
+binding = "CLOUD_SYNC_DB"
+database_name = "monochrome-cloud-sync"
+database_id = "replace-with-your-d1-database-id"

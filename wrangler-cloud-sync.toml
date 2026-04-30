@@ -1,0 +1,8 @@
+name = "monochrome-cloud-sync"
+main = "cloud-sync/worker.js"
+compatibility_date = "2026-04-30"
+
+[[d1_databases]]
+binding = "CLOUD_SYNC_DB"
+database_name = "hupchrome"
+database_id = "15d9ec38-2ec0-4743-bb56-ef1348bd372c"

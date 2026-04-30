@@ -2882,6 +2882,8 @@ body.multi-select-mode .track-item:hover {
     margin-top: 1.5rem;
     flex-wrap: wrap;
     align-items: center;
+    position: relative;
+    z-index: 10;
 }
 
 .detail-header-actions .btn-primary,
@@ -2894,6 +2896,19 @@ body.multi-select-mode .track-item:hover {
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+}
+
+/* Download split-button must NOT be collapsed to 40px circle */
+.detail-header-actions .btn-primary.dl-split-btn {
+    width: auto;
+    height: auto;
+    padding: 0;
+    border-radius: var(--radius-full);
+    overflow: visible;
+}
+
+.detail-header-actions .btn-primary.dl-split-btn span:not(.dl-menu-item-label):not(.dl-menu-item-desc) {
+    display: inline;
 }
 
 #page-party-detail .detail-header-actions .btn-primary,
@@ -2921,6 +2936,44 @@ body.multi-select-mode .track-item:hover {
     display: none;
 }
 
+/* dl-split-btn: un-hide the split parts but keep the menu hidden until .dl-open */
+.detail-header-actions .btn-primary.dl-split-btn .dl-main,
+.detail-header-actions .btn-primary.dl-split-btn .dl-chevron {
+    display: inline-flex;
+}
+
+.detail-header-actions .btn-primary.dl-split-btn .dl-main span,
+.detail-header-actions .btn-primary.dl-split-btn .dl-chevron span,
+.detail-header-actions .btn-primary.dl-split-btn .dl-menu-item-label {
+    display: inline;
+}
+
+.detail-header-actions .btn-primary.dl-split-btn .dl-menu-item-desc {
+    display: block;
+}
+
+.detail-header-actions .btn-primary.dl-split-btn .dl-menu-item {
+    display: flex;
+}
+
+/* Menu stays hidden by default; .dl-open reveals it */
+.detail-header-actions .btn-primary.dl-split-btn .dl-menu {
+    display: none;
+}
+
+.detail-header-actions .btn-primary.dl-split-btn.dl-open .dl-menu {
+    display: block;
+}
+
+/* Lift the open button above siblings so the menu isn't buried */
+.dl-split-btn.dl-open {
+    z-index: 1000;
+}
+
+.dl-split-btn .dl-menu {
+    z-index: 10000;
+}
+
 .btn-primary {
     display: inline-flex;
     align-items: center;
@@ -2944,6 +2997,12 @@ body.multi-select-mode .track-item:hover {
     -webkit-tap-highlight-color: transparent;
     position: relative;
     overflow: hidden;
+}
+
+/* Split-download button: popup must escape the button boundary */
+.btn-primary.dl-split-btn {
+    overflow: visible;
+    padding: 0;
 }
 
 .btn-primary:hover {

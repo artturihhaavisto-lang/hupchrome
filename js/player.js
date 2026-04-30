@@ -112,13 +112,45 @@ export class Player {
             .replace(/[^\p{L}\p{N}]/gu, '');
     }
 
+    /**
+     * Returns a quality rank for a local track's file format.
+     * Lower number = better quality (FLAC/lossless wins).
+     * @param {object} localTrack
+     * @returns {number}
+     */
+    _localFormatRank(localTrack) {
+        const fmt = String(
+            localTrack?.localFileFormat || localTrack?.format || localTrack?.file?.name || ''
+        )
+            .split('.')
+            .pop()
+            .toLowerCase();
+        switch (fmt) {
+            case 'flac': return 0;
+            case 'wav':  return 1;
+            case 'ogg':  return 2;
+            case 'm4a':
+            case 'mp4':  return 3;
+            case 'mp3':  return 4;
+            default:     return 5;
+        }
+    }
+
     pickBetterLocalMatch(currentMatch, candidate) {
         if (!currentMatch) return candidate;
 
+        // Prefer tracks matched by their canonical track ID first.
         const currentHasTrackId = !!currentMatch.localSource?.trackId;
         const candidateHasTrackId = !!candidate.localSource?.trackId;
         if (candidateHasTrackId !== currentHasTrackId) {
             return candidateHasTrackId ? candidate : currentMatch;
+        }
+
+        // Always prefer FLAC over m4a/mp3/etc. when both are present.
+        const currentRank = this._localFormatRank(currentMatch);
+        const candidateRank = this._localFormatRank(candidate);
+        if (candidateRank !== currentRank) {
+            return candidateRank < currentRank ? candidate : currentMatch;
         }
 
         const currentDuration = Number(currentMatch.duration || 0);

@@ -55,31 +55,131 @@ export const cloudflareSyncManager = {
         if (this._initPromise) return this._initPromise;
 
         this.attachPlaylistListener();
+
+        // Re-sync whenever the user switches back to this tab, so changes made
+        // on another browser/device are picked up without a full page reload.
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && this.isSignedIn) {
+                this.syncWithRemote().catch((err) =>
+                    console.warn('[Cloudflare Sync] Visibility re-sync failed:', err)
+                );
+            }
+        });
+
         this._initPromise = this.bootstrap().catch((error) => {
             console.error('[Cloudflare Sync] Bootstrap failed:', error);
         });
         return this._initPromise;
     },
 
+    /**
+     * Merges local and remote playlists by `updatedAt` timestamp.
+     * - Playlists only on one side are kept.
+     * - When both sides have the same playlist (by id/uuid), the newer one wins.
+     * Returns the merged array and whether the local side had newer data.
+     */
+    mergePlaylists(localPlaylists, remotePlaylists) {
+        const merged = new Map();
+
+        for (const p of remotePlaylists) {
+            merged.set(p.uuid || p.id, { ...p });
+        }
+
+        let localHasNewer = false;
+        for (const p of localPlaylists) {
+            const key = p.uuid || p.id;
+            const remote = merged.get(key);
+            if (!remote) {
+                // Local-only playlist — keep it and push later
+                merged.set(key, { ...p });
+                localHasNewer = true;
+            } else {
+                const localTs = Number(p.updatedAt || 0);
+                const remoteTs = Number(remote.updatedAt || 0);
+                
+                // Track union merge logic
+                const mergedTracks = [];
+                const seenTrackIds = new Set();
+                
+                // Keep the order of the newer playlist as the base
+                const basePlaylist = localTs > remoteTs ? p : remote;
+                const otherPlaylist = localTs > remoteTs ? remote : p;
+
+                for (const track of basePlaylist.tracks || []) {
+                    if (!seenTrackIds.has(track.id)) {
+                        mergedTracks.push(track);
+                        seenTrackIds.add(track.id);
+                    }
+                }
+                
+                let addedAny = false;
+                for (const track of otherPlaylist.tracks || []) {
+                    if (!seenTrackIds.has(track.id)) {
+                        mergedTracks.push(track);
+                        seenTrackIds.add(track.id);
+                        addedAny = true;
+                    }
+                }
+
+                // Push if local was newer OR if local was older but contained unique tracks not in remote
+                if (localTs > remoteTs || (basePlaylist === remote && addedAny)) {
+                    localHasNewer = true;
+                }
+
+                merged.set(key, { 
+                    ...basePlaylist, 
+                    tracks: mergedTracks,
+                    updatedAt: Math.max(localTs, remoteTs)
+                });
+            }
+        }
+
+        return { merged: Array.from(merged.values()), localHasNewer };
+    },
+
     async bootstrap() {
         if (!this.isSignedIn) return;
+        await this.syncWithRemote();
+    },
 
-        const localPlaylists = await db.getPlaylists(true);
-        const payload = await this.pullPlaylists();
+    /**
+     * Pulls remote playlists, merges with local by updatedAt, and pushes back
+     * if local had newer data.  Safe to call at any time (idempotent).
+     */
+    async syncWithRemote() {
+        if (!this.isSignedIn) return;
+
+        const [localPlaylists, payload] = await Promise.all([
+            db.getPlaylists(true),
+            this.pullPlaylists(),
+        ]);
+
         const remotePlaylists = Array.isArray(payload?.playlists) ? payload.playlists : [];
 
-        if (remotePlaylists.length > 0) {
-            await this.applyRemotePlaylists(remotePlaylists, payload.updatedAt || null);
+        if (remotePlaylists.length === 0 && localPlaylists.length > 0) {
+            // Remote is empty — push everything local
+            await this.pushPlaylists();
             return;
         }
 
-        if (localPlaylists.length > 0) {
+        if (remotePlaylists.length === 0) return;
+
+        const { merged, localHasNewer } = this.mergePlaylists(localPlaylists, remotePlaylists);
+
+        // Apply merged state locally (replaces DB contents)
+        await this.applyRemotePlaylists(merged, payload.updatedAt || null);
+
+        // If we had newer local data, push the merged result back to the cloud
+        // so the other browser gets it on its next sync.
+        if (localHasNewer) {
             await this.pushPlaylists();
         }
     },
 
     async createAccount() {
-        const response = await fetch(this.getEndpoint('/api/cloud/account'), {
+        const url = new URL(this.getEndpoint('/api/cloud/account'));
+        url.searchParams.set('t', Date.now());
+        const response = await fetch(url.toString(), {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ action: 'create' }),
@@ -92,7 +192,9 @@ export const cloudflareSyncManager = {
     },
 
     async register(username, password) {
-        const response = await fetch(this.getEndpoint('/api/cloud/account'), {
+        const url = new URL(this.getEndpoint('/api/cloud/account'));
+        url.searchParams.set('t', Date.now());
+        const response = await fetch(url.toString(), {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ action: 'register', username, password }),
@@ -110,7 +212,9 @@ export const cloudflareSyncManager = {
             return this.signInWithUsername(username, password);
         }
 
-        const response = await fetch(this.getEndpoint('/api/cloud/account'), {
+        const url = new URL(this.getEndpoint('/api/cloud/account'));
+        url.searchParams.set('t', Date.now());
+        const response = await fetch(url.toString(), {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ action: 'login', accountId, recoveryKey }),
@@ -123,7 +227,9 @@ export const cloudflareSyncManager = {
     },
 
     async signInWithUsername(username, password) {
-        const response = await fetch(this.getEndpoint('/api/cloud/account'), {
+        const url = new URL(this.getEndpoint('/api/cloud/account'));
+        url.searchParams.set('t', Date.now());
+        const response = await fetch(url.toString(), {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
             body: JSON.stringify({ action: 'login', username, password }),
@@ -202,7 +308,9 @@ export const cloudflareSyncManager = {
     async pushPlaylists() {
         if (!this.sessionToken) throw new Error('Not signed in to Cloudflare sync');
         const playlists = await db.getPlaylists(true);
-        const response = await fetch(this.getEndpoint('/api/cloud/playlists'), {
+        const url = new URL(this.getEndpoint('/api/cloud/playlists'));
+        url.searchParams.set('t', Date.now());
+        const response = await fetch(url.toString(), {
             method: 'PUT',
             headers: {
                 authorization: `Bearer ${this.sessionToken}`,
@@ -220,7 +328,9 @@ export const cloudflareSyncManager = {
 
     async pullPlaylists() {
         if (!this.sessionToken) throw new Error('Not signed in to Cloudflare sync');
-        const response = await fetch(this.getEndpoint('/api/cloud/playlists'), {
+        const url = new URL(this.getEndpoint('/api/cloud/playlists'));
+        url.searchParams.set('t', Date.now());
+        const response = await fetch(url.toString(), {
             headers: { authorization: `Bearer ${this.sessionToken}` },
         });
         const payload = await readJsonResponse(response);
@@ -230,7 +340,9 @@ export const cloudflareSyncManager = {
 
     async clearCloudData() {
         if (!this.sessionToken) throw new Error('Not signed in to Cloudflare sync');
-        const response = await fetch(this.getEndpoint('/api/cloud/playlists'), {
+        const url = new URL(this.getEndpoint('/api/cloud/playlists'));
+        url.searchParams.set('t', Date.now());
+        const response = await fetch(url.toString(), {
             method: 'PUT',
             headers: {
                 authorization: `Bearer ${this.sessionToken}`,

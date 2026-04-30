@@ -30,6 +30,18 @@ import { readableStreamIterator } from './readableStreamIterator.js';
 const downloadTasks = new Map();
 const bulkDownloadTasks = new Map();
 const ongoingDownloads = new Set();
+/**
+ * Tracks bulk-download keys that are currently in-flight.
+ * Key format: `bulk-${folderName}-${trackId}` for each track being downloaded.
+ * Value: 'flac' | 'non-flac' — the format that was obtained last time.
+ */
+const ongoingBulkDownloads = new Map();
+/**
+ * Session cache: track ID → best lossless quality confirmed available
+ * ('HI_RES_LOSSLESS' | 'LOSSLESS'), or 'LOSSY' when neither tier worked.
+ * Stream URLs expire so we only cache the tier name, not the URL itself.
+ */
+const trackQualityCache = new Map();
 let downloadNotificationContainer = null;
 
 /** Wraps a single {@link WriterEntry}-like object as an AsyncIterable for use with IBulkDownloadWriter.write(). */
@@ -412,12 +424,69 @@ async function downloadDirectStreamBlob(streamUrl, signal = null, onProgress = n
     });
 }
 
-async function downloadPlayableTrackBlob(track, quality, api, signal = null, onProgress = null) {
-    let streamInfo =
-        isLosslessQuality(quality) && !track.audioUrl && !track.remoteUrl
-            ? await getLosslessPlayableStreamInfo(track, api, signal)
-            : null;
+async function downloadPlayableTrackBlob(track, quality, api, signal = null, onProgress = null, skipFlacProbe = false) {
+    let streamInfo = null;
+    const cacheKey = String(track.id ?? '');
 
+    if (!track.audioUrl && !track.remoteUrl) {
+        const cachedTier = cacheKey ? trackQualityCache.get(cacheKey) : undefined;
+
+        if (cachedTier && cachedTier !== 'LOSSY') {
+            // ── Fast path: use the tier we already confirmed works ──────────
+            try {
+                const candidate = await api.getPlayableStreamInfo(track, cachedTier, {
+                    download: true,
+                    signal,
+                });
+                if (candidate && isLosslessStreamInfo(candidate)) {
+                    streamInfo = candidate;
+                }
+            } catch (err) {
+                if (err.name === 'AbortError') throw err;
+                // Cache may be stale — evict and fall through to full probe
+                trackQualityCache.delete(cacheKey);
+            }
+        }
+
+        if (!streamInfo && cachedTier !== 'LOSSY') {
+            // ── Parallel probe: fire HI_RES (manifest) + LOSSLESS simultaneously ─
+            // This cuts the "not available" penalty from 2 sequential failures
+            // down to 1 parallel round-trip.
+            const manifestProbe = getLosslessPlayableStreamInfo(track, api, signal)
+                .then((si) => (si ? { si, tier: 'HI_RES_LOSSLESS' } : null))
+                .catch((err) => {
+                    if (err.name === 'AbortError') throw err;
+                    return null;
+                });
+
+            const losslessProbe =
+                typeof api.getPlayableStreamInfo === 'function'
+                    ? api
+                          .getPlayableStreamInfo(track, 'LOSSLESS', { download: true, signal })
+                          .then((si) =>
+                              si && isLosslessStreamInfo(si) ? { si, tier: 'LOSSLESS' } : null
+                          )
+                          .catch((err) => {
+                              if (err.name === 'AbortError') throw err;
+                              return null;
+                          })
+                    : Promise.resolve(null);
+
+            const [hiResResult, losslessResult] = await Promise.all([manifestProbe, losslessProbe]);
+
+            // Prefer HI_RES_LOSSLESS > LOSSLESS
+            const winner = hiResResult ?? losslessResult;
+            if (winner?.si) {
+                streamInfo = winner.si;
+                if (cacheKey) trackQualityCache.set(cacheKey, winner.tier);
+            } else {
+                // Neither lossless tier is available for this track
+                if (cacheKey) trackQualityCache.set(cacheKey, 'LOSSY');
+            }
+        }
+    }
+
+    // Fall back to the originally requested quality (or direct URL)
     if (!streamInfo) {
         streamInfo =
             track.audioUrl || track.remoteUrl
@@ -449,26 +518,140 @@ async function downloadPlayableTrackBlob(track, quality, api, signal = null, onP
     return { blob, extension };
 }
 
-async function downloadTrackBlob(track, quality, api, signal = null, onProgress = null) {
+async function downloadTrackBlob(track, quality, api, signal = null, onProgress = null, skipFlacProbe = false) {
     const shouldUsePlayableResolver =
         track?.audioUrl || track?.remoteUrl || !isCanonicalTidalTrackId(track?.id);
 
     if (shouldUsePlayableResolver && typeof api.getPlayableStreamInfo === 'function') {
-        return downloadPlayableTrackBlob(track, quality, api, signal, onProgress);
+        return downloadPlayableTrackBlob(track, quality, api, signal, onProgress, skipFlacProbe);
     }
 
-    const blob = await api.downloadTrack(track.id, quality, undefined, {
-        track,
-        signal,
-        onProgress,
-        triggerDownload: false,
-        calculateDashBytes: false,
-    });
+    // ── Canonical Tidal track ─────────────────────────────────────────────
+    const cacheKey = String(track.id ?? '');
+    const cachedTier = !skipFlacProbe && cacheKey ? trackQualityCache.get(cacheKey) : undefined;
+    let bestQuality = quality;
 
-    // Detect actual format from blob signature BEFORE adding metadata
-    const extension = await getExtensionFromBlob(blob);
+    if (cachedTier === 'LOSSY') {
+        // Already confirmed: lossless is not available — skip the probe
+    } else if (cachedTier) {
+        // Already confirmed: use the cached lossless tier
+        bestQuality = cachedTier;
+    } else {
+        // ── Parallel lightweight probe — no full download ─────────────────
+        // Fire the manifest fallback check (HI_RES) and a direct LOSSLESS
+        // stream-info request simultaneously.  Neither transfers audio data.
+        const manifestProbe = getLosslessPlayableStreamInfo(track, api, signal)
+            .then((si) => (si ? 'HI_RES_LOSSLESS' : null))
+            .catch((err) => {
+                if (err.name === 'AbortError') throw err;
+                return null;
+            });
 
-    return { blob, extension };
+        const losslessProbe =
+            typeof api.getPlayableStreamInfo === 'function'
+                ? api
+                      .getPlayableStreamInfo(track, 'LOSSLESS', { download: true, signal })
+                      .then((si) => (si && isLosslessStreamInfo(si) ? 'LOSSLESS' : null))
+                      .catch((err) => {
+                          if (err.name === 'AbortError') throw err;
+                          return null;
+                      })
+                : Promise.resolve(null);
+
+        const [hiResResult, losslessResult] = await Promise.all([manifestProbe, losslessProbe]);
+
+        const confirmedTier = hiResResult ?? losslessResult ?? null;
+        if (confirmedTier) {
+            bestQuality = confirmedTier;
+            if (cacheKey) trackQualityCache.set(cacheKey, confirmedTier);
+        } else {
+            // Neither lossless tier is available — cache to skip future probes
+            if (cacheKey) trackQualityCache.set(cacheKey, 'LOSSY');
+        }
+    }
+
+    // ── Single download with the confirmed-best quality ───────────────────
+    try {
+        const blob = await api.downloadTrack(track.id, bestQuality, undefined, {
+            track,
+            signal,
+            onProgress,
+            triggerDownload: false,
+            calculateDashBytes: false,
+        });
+
+        const extension = await getExtensionFromBlob(blob);
+        return { blob, extension };
+    } catch (err) {
+        if (err.name === 'AbortError') throw err;
+        console.warn(`[download] Native download failed for track ${track.id}, attempting playable fallback...`, err.message);
+        return downloadPlayableTrackBlob(track, quality, api, signal, onProgress, skipFlacProbe);
+    }
+}
+
+/** Audio extensions recognised for local-file matching, ordered by preference. */
+const AUDIO_EXTS = new Set(['flac', 'm4a', 'mp3', 'ogg', 'mp4', 'wav']);
+/** Lower rank = better quality (used to prefer FLAC over m4a in the index). */
+const AUDIO_EXT_RANK = { flac: 0, wav: 1, ogg: 2, m4a: 3, mp4: 3, mp3: 4 };
+
+/**
+ * Scans a target subfolder **once** and returns a Map whose keys are
+ * lowercased relative paths without their file extension (e.g.
+ * `"playlist title/01 - track name"`) and whose values are the best audio
+ * extension found for that path (`"flac"`, `"m4a"`, …).
+ *
+ * This replaces per-track `getFileHandle` probing: instead of up to
+ * (6 extensions × N tracks) async FS round-trips, we do a single
+ * directory walk up-front and then answer each per-track lookup in O(1).
+ *
+ * @param {FileSystemDirectoryHandle} rootHandle
+ * @param {string} subfolderPath  - e.g. "My Playlist" or "Artist/Album"
+ * @returns {Promise<Map<string, string>>}
+ */
+async function buildFolderFileIndex(rootHandle, subfolderPath) {
+    /** @type {Map<string, string>} */
+    const index = new Map();
+    if (!rootHandle || typeof rootHandle.getDirectoryHandle !== 'function') return index;
+
+    async function scanDir(dirHandle, pathPrefix) {
+        try {
+            for await (const entry of dirHandle.values()) {
+                const fullPath = pathPrefix ? `${pathPrefix}/${entry.name}` : entry.name;
+                if (entry.kind === 'file') {
+                    const dotIdx = entry.name.lastIndexOf('.');
+                    if (dotIdx < 0) continue;
+                    const ext = entry.name.slice(dotIdx + 1).toLowerCase();
+                    if (!AUDIO_EXTS.has(ext)) continue;
+                    // Key: full path relative to rootHandle, without extension, lowercased
+                    const key = fullPath.slice(0, fullPath.lastIndexOf('.')).toLowerCase();
+                    const existing = index.get(key);
+                    // Keep the highest-quality format when duplicates exist
+                    if (!existing || (AUDIO_EXT_RANK[ext] ?? 99) < (AUDIO_EXT_RANK[existing] ?? 99)) {
+                        index.set(key, ext);
+                    }
+                } else if (entry.kind === 'directory') {
+                    const subDir = await dirHandle.getDirectoryHandle(entry.name);
+                    await scanDir(subDir, fullPath);
+                }
+            }
+        } catch {
+            // Inaccessible entry — skip
+        }
+    }
+
+    try {
+        // Navigate to the target subfolder within rootHandle
+        const parts = subfolderPath.split('/').filter(Boolean);
+        let dir = rootHandle;
+        for (const part of parts) {
+            dir = await dir.getDirectoryHandle(part);
+        }
+        await scanDir(dir, subfolderPath);
+    } catch {
+        // Subfolder doesn't exist yet — index stays empty
+    }
+
+    return index;
 }
 
 async function bulkDownload({
@@ -482,11 +665,21 @@ async function bulkDownload({
     coverBlob = null,
     type = 'playlist',
     metadata = null,
+    skipFlacProbe = false,
 }) {
     const { abortController } = bulkDownloadTasks.get(notification);
     const signal = abortController.signal;
     let downloadedTrackCount = 0;
+    let skippedTrackCount = 0;
     let failedTrackCount = 0;
+
+    // Grab the underlying folder handle when the writer supports it (FolderPickerWriter).
+    // This lets us probe for already-existing files before downloading.
+    const folderHandle = typeof writer?.getDirHandle === 'function' ? writer.getDirHandle() : null;
+
+    // Pre-scan the destination folder once so per-track existence checks are
+    // O(1) Map lookups instead of multiple async getFileHandle round-trips.
+    const fileIndex = folderHandle ? await buildFolderFileIndex(folderHandle, folderName) : null;
 
     async function* yieldFiles() {
         // Add cover if available and enabled
@@ -503,28 +696,85 @@ async function bulkDownload({
         for (let i = 0; i < tracks.length; i++) {
             if (signal.aborted) break;
             const track = tracks[i];
+            const trackId = String(track.id ?? i);
             const trackTitle = getTrackTitle(track);
+            const bulkKey = `bulk-${folderName}-${trackId}`;
             let fileFraction = 0;
 
             updateBulkDownloadProgress(notification, i, tracks.length, trackTitle);
 
-            try {
-                const { blob, extension } = await downloadTrackBlob(track, quality, api, signal, (p) => {
-                    if (p instanceof DownloadProgress && p.totalBytes && p.receivedBytes) {
-                        fileFraction = p.receivedBytes / p.totalBytes;
-                    } else if (p instanceof SegmentedDownloadProgress && p.currentSegment && p.totalSegments) {
-                        fileFraction = p.currentSegment / p.totalSegments;
-                    }
+            // ── Shared per-track skip/retry state ─────────────────────────────
+            const discNumber = discLayout.resolveDiscNumber(i);
+            const predictedFlacName = buildTrackFilename(track, quality, 'flac');
+            const predictedDiscPath = separateByDisc
+                ? `${getDiscFolderName(discNumber)}/${predictedFlacName}`
+                : predictedFlacName;
 
-                    fileFraction = Math.min(fileFraction, 0.99); // Cap at 99% to avoid showing 100% before finalization
-                    updateBulkDownloadProgress(notification, i + fileFraction, tracks.length, trackTitle, p);
-                });
+            // ── Folder index check (O(1) Map lookup) ─────────────────────────
+            if (fileIndex) {
+                const zipPath = buildZipTrackPath(folderName, predictedFlacName, separateByDisc, discNumber);
+                // Strip extension and lowercase for the index key
+                const indexKey = zipPath.slice(0, zipPath.lastIndexOf('.')).toLowerCase();
+                const existingExt = fileIndex.get(indexKey) ?? null;
+
+                if (existingExt === 'flac' || (skipFlacProbe && existingExt)) {
+                    // Already have FLAC, OR quick-mode is on and *any* format exists — skip entirely
+                    console.log(`[download] Skipping "${trackTitle}" — ${existingExt.toUpperCase()} already exists`);
+                    // Use the actual extension instead of assuming .flac
+                    trackPaths.push(predictedDiscPath.replace('.flac', `.${existingExt}`));
+                    skippedTrackCount += 1;
+                    downloadedTrackCount += 1; // Count as success for progress
+                    updateBulkDownloadProgress(
+                        notification,
+                        i + 1,
+                        tracks.length,
+                        `${trackTitle} (skipped — ${existingExt.toUpperCase()} exists)`
+                    );
+                    continue;
+                }
+
+                if (existingExt && existingExt !== 'flac') {
+                    // Non-FLAC exists — proceed but the lossless-first waterfall
+                    // in downloadTrackBlob will try to upgrade it to FLAC
+                    console.log(`[download] "${trackTitle}" exists as .${existingExt} — retrying for FLAC`);
+                }
+            }
+
+            // ── Also skip tracks already confirmed as FLAC by a concurrent task ─
+            if (ongoingBulkDownloads.get(bulkKey) === 'flac') {
+                console.log(`[download] Skipping "${trackTitle}" — already downloading as FLAC`);
+                trackPaths.push(predictedDiscPath);
+                skippedTrackCount += 1;
+                downloadedTrackCount += 1;
+                continue;
+            }
+
+            ongoingBulkDownloads.set(bulkKey, 'pending');
+
+            try {
+                const { blob, extension } = await downloadTrackBlob(
+                    track, quality, api, signal,
+                    (p) => {
+                        if (p instanceof DownloadProgress && p.totalBytes && p.receivedBytes) {
+                            fileFraction = p.receivedBytes / p.totalBytes;
+                        } else if (p instanceof SegmentedDownloadProgress && p.currentSegment && p.totalSegments) {
+                            fileFraction = p.currentSegment / p.totalSegments;
+                        }
+                        fileFraction = Math.min(fileFraction, 0.99);
+                        updateBulkDownloadProgress(notification, i + fileFraction, tracks.length, trackTitle, p);
+                    },
+                    skipFlacProbe
+                );
                 const filename = buildTrackFilename(track, quality, extension);
                 const discNumber = discLayout.resolveDiscNumber(i);
                 const discPath = separateByDisc ? `${getDiscFolderName(discNumber)}/${filename}` : filename;
 
                 trackPaths.push(discPath);
                 downloadedTrackCount += 1;
+
+                // Record the format so concurrent bulk downloads of the same playlist
+                // can skip this track if it was obtained as FLAC.
+                ongoingBulkDownloads.set(bulkKey, extension === 'flac' ? 'flac' : 'non-flac');
 
                 yield {
                     name: buildZipTrackPath(folderName, filename, separateByDisc, discNumber),
@@ -555,10 +805,11 @@ async function bulkDownload({
                 console.error(`Failed to download track ${trackTitle}:`, err);
                 failedTrackCount += 1;
                 trackPaths.push(null);
+                ongoingBulkDownloads.delete(bulkKey);
             }
         }
 
-        if (downloadedTrackCount === 0) {
+        if (downloadedTrackCount === 0 && skippedTrackCount === 0) {
             throw new Error('All playlist tracks failed to download. No audio files were saved.');
         }
 
@@ -642,7 +893,7 @@ async function bulkDownload({
     }
 
     await writer.write(yieldFiles());
-    return { downloadedTrackCount, failedTrackCount };
+    return { downloadedTrackCount, skippedTrackCount, failedTrackCount };
 }
 
 /**
@@ -811,6 +1062,7 @@ async function startBulkDownload({
     single = false,
     writer = null,
     refreshLocalMedia = modernSettings.bulkDownloadMethod === BulkDownloadMethod.LocalMedia,
+    skipFlacProbe = false,
 }) {
     const notification = createBulkDownloadNotification(type, name, tracks.length);
 
@@ -819,7 +1071,7 @@ async function startBulkDownload({
         let result = null;
 
         if (resolvedWriter) {
-            result = await bulkDownload({
+                    result = await bulkDownload({
                 tracks,
                 folderName,
                 api,
@@ -830,17 +1082,21 @@ async function startBulkDownload({
                 coverBlob,
                 type,
                 metadata,
+                skipFlacProbe,
             });
         }
 
         if (result?.failedTrackCount > 0) {
+            const skippedNote = result.skippedTrackCount > 0 ? `, ${result.skippedTrackCount} skipped` : '';
             completeBulkDownload(
                 notification,
                 false,
                 result.downloadedTrackCount > 0
-                    ? `Downloaded ${result.downloadedTrackCount} tracks, ${result.failedTrackCount} failed.`
+                    ? `Downloaded ${result.downloadedTrackCount - (result.skippedTrackCount ?? 0)} tracks${skippedNote}, ${result.failedTrackCount} failed.`
                     : 'No tracks downloaded.'
             );
+        } else if (result?.skippedTrackCount > 0 && result.downloadedTrackCount === result.skippedTrackCount) {
+            completeBulkDownload(notification, true, `All ${result.skippedTrackCount} tracks already downloaded as FLAC ✓`);
         } else {
             completeBulkDownload(notification, true);
         }
@@ -898,7 +1154,7 @@ export async function downloadAlbum(album, tracks, api, quality, _lyricsManager 
     });
 }
 
-export async function downloadPlaylist(playlist, tracks, api, quality, _lyricsManager = null) {
+export async function downloadPlaylist(playlist, tracks, api, quality, _lyricsManager = null, skipFlacProbe = false) {
     const folderName = formatPathTemplate(modernSettings.folderTemplate, {
         albumTitle: playlist.title,
         albumArtist: 'Playlist',
@@ -916,10 +1172,11 @@ export async function downloadPlaylist(playlist, tracks, api, quality, _lyricsMa
         coverBlob,
         metadata: playlist,
         api,
+        skipFlacProbe,
     });
 }
 
-export async function downloadPlaylistToLocalMedia(playlist, tracks, api, _lyricsManager = null) {
+export async function downloadPlaylistToLocalMedia(playlist, tracks, api, _lyricsManager = null, skipFlacProbe = false) {
     const folderName = formatPathTemplate(modernSettings.folderTemplate, {
         albumTitle: playlist.title,
         albumArtist: 'Playlist',
@@ -941,6 +1198,7 @@ export async function downloadPlaylistToLocalMedia(playlist, tracks, api, _lyric
         api,
         writer,
         refreshLocalMedia: true,
+        skipFlacProbe,
     });
 }
 

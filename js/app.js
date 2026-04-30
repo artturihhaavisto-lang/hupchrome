@@ -1231,6 +1231,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             const btn = e.target.closest('#download-playlist-btn');
             if (btn.disabled) return;
 
+            // Dropdown option can tag itself with data-skip-flac-probe="true"
+            const skipFlacProbe = e.target.closest('[data-skip-flac-probe]')?.dataset.skipFlacProbe === 'true';
+
             const playlistId = window.location.pathname.split('/')[2];
             if (!playlistId) return;
 
@@ -1264,7 +1267,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                     playlist,
                     tracks,
                     MusicAPI.instance,
-                    lyricsManager
+                    lyricsManager,
+                    skipFlacProbe
                 );
             } catch (error) {
                 console.error('Playlist download failed:', error);

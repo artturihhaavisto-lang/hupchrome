@@ -145,6 +145,120 @@ const TRACKLIST_HEADER_WITH_LIKE_COL_HTML = `
     </div>
 `;
 
+// ── Download split-dropdown ───────────────────────────────────────────────────
+// Injects a split-button UI into any download button element.
+// Left portion = default FLAC-priority download.
+// Right chevron = opens a mini menu with mode options.
+
+(function installDownloadDropdownStyles() {
+    if (document.getElementById('dl-dropdown-styles')) return;
+    const style = document.createElement('style');
+    style.id = 'dl-dropdown-styles';
+    style.textContent = `
+        .dl-split-btn {
+            display: inline-flex;
+            align-items: center;
+            position: relative;
+            padding: 0;
+            overflow: visible;
+        }
+        .dl-split-btn .dl-main {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.45rem 0.7rem;
+            border-right: 1px solid rgba(255,255,255,0.15);
+            white-space: nowrap;
+        }
+        .dl-split-btn .dl-chevron {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.45rem 0.5rem;
+            cursor: pointer;
+            border-left: none;
+            opacity: 0.8;
+            transition: opacity 0.15s;
+        }
+        .dl-split-btn .dl-chevron:hover { opacity: 1; }
+        .dl-split-btn .dl-menu {
+            display: none;
+            position: absolute;
+            top: calc(100% + 6px);
+            right: 0;
+            min-width: 210px;
+            background: var(--popover, #1e1e2e);
+            border: 1px solid var(--border, rgba(255,255,255,0.12));
+            border-radius: 8px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+            z-index: 9999;
+            overflow: hidden;
+        }
+        .dl-split-btn.dl-open .dl-menu { display: block; }
+        .dl-menu-item {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            padding: 0.65rem 1rem;
+            cursor: pointer;
+            transition: background 0.12s;
+            font-size: 0.88rem;
+        }
+        .dl-menu-item:hover { background: rgba(255,255,255,0.07); }
+        .dl-menu-item + .dl-menu-item { border-top: 1px solid var(--border, rgba(255,255,255,0.08)); }
+        .dl-menu-item-label { font-weight: 500; color: var(--foreground, #fff); }
+        .dl-menu-item-desc { font-size: 0.76rem; color: var(--muted-foreground, rgba(255,255,255,0.5)); }
+    `;
+    document.head.appendChild(style);
+})();
+
+// Close any open dropdown when clicking outside
+document.addEventListener('click', (e) => {
+    if (!e.target.closest('.dl-split-btn')) {
+        document.querySelectorAll('.dl-split-btn.dl-open').forEach((b) => b.classList.remove('dl-open'));
+    }
+}, true);
+
+/**
+ * Converts a plain download button into a split-dropdown.
+ * @param {HTMLElement} btn
+ * @param {string} label  - Text shown on the main action (e.g. "Download")
+ */
+function setDownloadDropdownHTML(btn, label) {
+    btn.classList.add('dl-split-btn');
+    btn.innerHTML = `
+        <span class="dl-main">
+            ${SVG_DOWNLOAD(18)}<span>${label}</span>
+        </span>
+        <span class="dl-chevron" title="Download options">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+        </span>
+        <div class="dl-menu">
+            <div class="dl-menu-item" data-skip-flac-probe="false">
+                <span class="dl-menu-item-label">✦ FLAC Priority</span>
+                <span class="dl-menu-item-desc">Probes for lossless quality first (slower start)</span>
+            </div>
+            <div class="dl-menu-item" data-skip-flac-probe="true">
+                <span class="dl-menu-item-label">⚡ Skip Existing</span>
+                <span class="dl-menu-item-desc">Skips tracks you already have (any quality)</span>
+            </div>
+        </div>
+    `;
+
+    // Chevron toggles the dropdown; clicks on dl-menu-item bubble up to app.js handler
+    btn.querySelector('.dl-chevron').addEventListener('click', (e) => {
+        e.stopPropagation();
+        btn.classList.toggle('dl-open');
+    });
+
+    // Clicking a menu item closes the dropdown (the actual download is handled by app.js)
+    btn.querySelectorAll('.dl-menu-item').forEach((item) => {
+        item.addEventListener('click', () => btn.classList.remove('dl-open'));
+    });
+}
+
 export class UIRenderer {
     static #instance = null;
 
@@ -3909,7 +4023,7 @@ export class UIRenderer {
         const playBtn = document.getElementById('play-album-btn');
         if (playBtn) playBtn.innerHTML = `${SVG_PLAY(20)}<span>Play Album</span>`;
         const dlBtn = document.getElementById('download-album-btn');
-        if (dlBtn) dlBtn.innerHTML = `${SVG_DOWNLOAD(20)}<span>Download Album</span>`;
+        if (dlBtn) setDownloadDropdownHTML(dlBtn, 'Download Album');
         const mixBtn = document.getElementById('album-mix-btn');
         if (mixBtn) mixBtn.style.display = 'none';
 
@@ -4410,7 +4524,7 @@ export class UIRenderer {
         const playBtn = document.getElementById('play-playlist-btn');
         if (playBtn) playBtn.innerHTML = `${SVG_PLAY(20)}<span>Play</span>`;
         const dlBtn = document.getElementById('download-playlist-btn');
-        if (dlBtn) dlBtn.innerHTML = `${SVG_DOWNLOAD(20)}<span>Download</span>`;
+        if (dlBtn) setDownloadDropdownHTML(dlBtn, 'Download');
         const addPlaylistBtn = document.getElementById('add-playlist-to-playlist-btn');
 
         imageEl.src = '';
@@ -4775,8 +4889,7 @@ export class UIRenderer {
         const playBtn = document.getElementById('play-mix-btn');
         if (playBtn) playBtn.innerHTML = `${SVG_PLAY(20)}<span>Play</span>`;
         const dlBtn = document.getElementById('download-mix-btn');
-        if (dlBtn) dlBtn.innerHTML = `${SVG_DOWNLOAD(20)}<span>Download</span>`;
-
+        if (dlBtn) setDownloadDropdownHTML(dlBtn, 'Download');
         // Skeleton loading
         imageEl.src = '';
         imageEl.style.backgroundColor = 'var(--muted)';

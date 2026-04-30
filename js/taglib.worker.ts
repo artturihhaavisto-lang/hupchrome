@@ -248,6 +248,7 @@ export async function getMetadataFromAudio(message: _GetMetadataMessage): Promis
     data.copyright = props.get('COPYRIGHT')?.[0] || undefined;
     data.lyrics = props.get('LYRICS')?.[0] || undefined;
     data.releaseDate = props.get('DATE')?.[0] || undefined;
+    const extra: Record<string, string> = {};
 
     const replayGain: TagLibMetadata['replayGain'] = {};
     const albumGain = props.get('REPLAYGAIN_ALBUM_GAIN')?.[0];
@@ -261,6 +262,14 @@ export async function getMetadataFromAudio(message: _GetMetadataMessage): Promis
     if (Object.keys(replayGain).length > 0) data.replayGain = replayGain;
 
     data.isrc = props.get('ISRC')?.[0] || undefined;
+
+    for (const key of ['TIDAL_TRACK_ID', 'TIDAL_ALBUM_ID', 'TIDAL_TRACK_URL', 'TIDAL_ALBUM_URL', 'TIDAL_DATA']) {
+        const value = props.get(key)?.[0];
+        if (value) extra[key] = value;
+    }
+    if (Object.keys(extra).length > 0) {
+        data.extra = extra;
+    }
 
     if (isMp4) {
         const mp4Tag = underlying.tag();

@@ -5,6 +5,7 @@ import {
     getMimeType,
     getTrackCoverId,
     getFullArtistArray,
+    getExtensionFromBlob,
 } from './utils.js';
 import { addMetadataWithTagLib, getMetadataWithTagLib } from './taglib.ts';
 import { LyricsManager } from './lyrics.js';
@@ -147,6 +148,13 @@ export async function addMetadataToAudio(audioBlob, track, _api, _quality, prefe
  * @returns {Promise<Object>} Track metadata
  */
 export async function readTrackMetadata(file, { filename = file?.name || 'Unknown Title', siblings } = {}) {
+    const formatSource = file instanceof Blob ? file : new Blob([file]);
+    const localFileFormat = await getExtensionFromBlob(formatSource).catch(() => {
+        const extension = filename?.split('.').pop()?.toLowerCase();
+        return extension || null;
+    });
+    const localAudioQuality = getLocalAudioQuality(localFileFormat);
+
     const metadata = {
         title: filename?.replace(/\.[^/.]+$/, ''),
         artists: [],
@@ -157,8 +165,17 @@ export async function readTrackMetadata(file, { filename = file?.name || 'Unknow
         copyright: null,
         explicit: false,
         isLocal: true,
+        audioQuality: localAudioQuality,
+        localFileFormat,
         file: file,
         id: `local-${filename}-${file.lastModified}`,
+        localSource: {
+            trackId: null,
+            albumId: null,
+            trackUrl: null,
+            albumUrl: null,
+            rawTrackData: null,
+        },
     };
 
     try {
@@ -194,6 +211,13 @@ export async function readTrackMetadata(file, { filename = file?.name || 'Unknow
             metadata.isrc = data.isrc || metadata.isrc;
             metadata.copyright = data.copyright || metadata.copyright;
             metadata.explicit = !!data.explicit;
+            metadata.localSource = {
+                trackId: data.extra?.TIDAL_TRACK_ID || null,
+                albumId: data.extra?.TIDAL_ALBUM_ID || null,
+                trackUrl: data.extra?.TIDAL_TRACK_URL || null,
+                albumUrl: data.extra?.TIDAL_ALBUM_URL || null,
+                rawTrackData: data.extra?.TIDAL_DATA || null,
+            };
         }
     } catch (e) {
         console.warn('Error reading metadata for', filename, e);
@@ -217,4 +241,18 @@ export async function readTrackMetadata(file, { filename = file?.name || 'Unknow
     }
 
     return metadata;
+}
+
+function getLocalAudioQuality(format) {
+    switch (String(format || '').toLowerCase()) {
+        case 'flac':
+            return 'LOSSLESS';
+        case 'm4a':
+        case 'mp4':
+        case 'mp3':
+        case 'ogg':
+            return 'HIGH';
+        default:
+            return null;
+    }
 }

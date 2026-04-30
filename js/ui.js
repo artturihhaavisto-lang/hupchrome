@@ -4993,18 +4993,29 @@ export class UIRenderer {
                     queue
                         .flatMap((t) => t?.artists || [])
                         .find((a) => a?.id === artistId)?.name ||
-                    '';
+                    decodeURIComponent(artistId).replace(/[-_]+/g, ' ').trim();
                 if (queryName) {
                     const search = await this.api.searchArtists(queryName);
                     const candidates = search?.items || [];
+                    const normalizedQuery = queryName.trim().toLowerCase();
                     const exact = candidates.find(
-                        (a) => String((a?.name || '').trim()).toLowerCase() === queryName.trim().toLowerCase()
+                        (a) => String((a?.name || '').trim()).toLowerCase() === normalizedQuery
                     );
-                    const picked = exact || candidates[0];
+                    const loose = candidates.find((a) => {
+                        const name = String(a?.name || '').trim().toLowerCase();
+                        return name === normalizedQuery || name.replace(/[^\w\s]/g, '') === normalizedQuery;
+                    });
+                    const picked = exact || loose || candidates[0];
                     if (picked?.id && /^\d+$/.test(String(picked.id))) {
-                        resolvedArtistId = picked.id;
+                        resolvedArtistId = String(picked.id);
                     }
                 }
+            }
+
+            this.currentArtistId = resolvedArtistId;
+            if (String(resolvedArtistId) !== String(artistId)) {
+                const providerPrefix = provider === 'tidal' ? '/t' : '';
+                window.history.replaceState({}, '', `/artist${providerPrefix}/${resolvedArtistId}`);
             }
 
             const artist = await this.api.getArtist(resolvedArtistId, provider);
@@ -5189,7 +5200,7 @@ export class UIRenderer {
                 } else {
                     // Try to fetch biography asynchronously
                     this.api
-                        .getArtistBiography(artistId, provider)
+                        .getArtistBiography(resolvedArtistId, provider)
                         .then((bio) => {
                             if (bio) renderBioPreview(bio);
                         })
@@ -5213,7 +5224,7 @@ export class UIRenderer {
             // Similar Artists
             if (similarContainer && similarSection) {
                 this.api
-                    .getSimilarArtists(artistId)
+                    .getSimilarArtists(resolvedArtistId)
                     .then(async (similar) => {
                         // Filter out blocked artists
                         const { contentBlockingSettings } = await import('./storage.js');

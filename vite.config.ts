@@ -164,6 +164,7 @@ function getGitCommitHash() {
 
 export default defineConfig((_options) => {
     const commitHash = getGitCommitHash();
+    const cloudSyncApiBase = process.env.VITE_CLOUD_SYNC_API_BASE || '';
 
     return {
         test: {
@@ -179,6 +180,7 @@ export default defineConfig((_options) => {
         define: {
             __COMMIT_HASH__: JSON.stringify(commitHash),
             __VITEST__: !!process.env.VITEST,
+            __MONOCHROME_CLOUD_SYNC_API__: JSON.stringify(cloudSyncApiBase),
         },
         worker: {
             format: 'es',

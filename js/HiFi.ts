@@ -1434,6 +1434,25 @@ class HiFiClient {
         return parts.length >= 9 ? parts.slice(4, 9).join('-') : null;
     }
 
+    static #parseDurationSeconds(value: unknown): number | undefined {
+        if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+        if (typeof value !== 'string') return undefined;
+
+        const trimmed = value.trim();
+        if (!trimmed) return undefined;
+        if (/^\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
+
+        const isoMatch = trimmed.match(
+            /^P(?:\d+Y)?(?:\d+M)?(?:\d+W)?(?:\d+D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i
+        );
+        if (!isoMatch) return undefined;
+
+        const hours = Number(isoMatch[1] || 0);
+        const minutes = Number(isoMatch[2] || 0);
+        const seconds = Number(isoMatch[3] || 0);
+        return hours * 3600 + minutes * 60 + seconds;
+    }
+
     async #withAlbumTrackSlot<T>(fn: () => Promise<T>) {
         if (this.#albumTracksActive >= this.#albumTracksMax) {
             await new Promise<void>((res) => this.#albumTracksQueue.push(res));
@@ -1794,7 +1813,7 @@ class HiFiClient {
                         albums.push({
                             id: Number(al.id),
                             title: al.attributes?.title,
-                            duration: al.attributes?.duration ? 100 : undefined,
+                            duration: HiFiClient.#parseDurationSeconds(al.attributes?.duration),
                             numberOfTracks: al.attributes?.numberOfItems,
                             releaseDate: al.attributes?.releaseDate,
                             type: al.attributes?.albumType,
@@ -1824,7 +1843,7 @@ class HiFiClient {
                         tracks.push({
                             id: Number(tr.id),
                             title: tr.attributes?.title,
-                            duration: tr.attributes?.duration ? 100 : undefined,
+                            duration: HiFiClient.#parseDurationSeconds(tr.attributes?.duration),
                             album: albumInfo,
                             artist: { id: artist_data.id, name: artist_data.name },
                         });

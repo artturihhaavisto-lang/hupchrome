@@ -235,6 +235,28 @@ describe('Player', () => {
         expect(badge.title).toContain('qobuz');
     });
 
+    test('does not label AAC streams as lossless even when provider quality says lossless', () => {
+        player = new Player(audioElement, api);
+
+        player.updateNowPlayingTitle({
+            id: 'track-1',
+            title: 'One More Time',
+            audioQuality: 'LOSSLESS',
+            streamInfo: {
+                url: 'https://amz-pr-fa.audio.tidal.com/audio.mp4?token=abc',
+                format: 'aac',
+                quality: 'LOSSLESS',
+            },
+        });
+
+        const title = document.querySelector('.now-playing-bar .title');
+        const badge = document.querySelector('.stream-quality-badge');
+        expect(badge).not.toBeNull();
+        expect(badge.textContent).toBe('AAC');
+        expect(title.textContent).not.toContain('Lossless');
+        expect(title.textContent).not.toContain('FLAC');
+    });
+
     test('fetchBlobWithProgress retries remote streams through audio proxy after fetch failure', async () => {
         player = new Player(audioElement, api);
         const blob = new Blob(['audio']);
@@ -340,5 +362,67 @@ describe('Player', () => {
         expect(player.isStreamInfoFresh({ url: 'https://example.com/audio.flac' })).toBe(true);
         expect(player.isStreamInfoFresh({ url: 'https://example.com/audio.flac', expiresAt: now + 120 })).toBe(true);
         expect(player.isStreamInfoFresh({ url: 'https://example.com/audio.flac', expiresAt: now + 10 })).toBe(false);
+    });
+
+    test('prefers a downloaded local file when the embedded track id matches', () => {
+        player = new Player(audioElement, api);
+
+        window.localFilesCache = [
+            {
+                id: 'local-one',
+                title: 'One More Time',
+                artist: { name: 'Daft Punk' },
+                artists: [{ name: 'Daft Punk' }],
+                album: { title: 'Discovery', cover: 'local-cover' },
+                duration: 320,
+                isLocal: true,
+                file: new File(['audio'], 'one-more-time.flac', { type: 'audio/flac' }),
+                localSource: { trackId: '12345' },
+            },
+        ];
+
+        const resolved = player.applyLocalPlaybackOverride({
+            id: '12345',
+            title: 'One More Time',
+            artist: { name: 'Daft Punk' },
+            artists: [{ name: 'Daft Punk' }],
+            album: { id: 'album-1', title: 'Discovery', releaseDate: '2001-01-01' },
+            duration: 320,
+        });
+
+        expect(resolved.isLocal).toBe(true);
+        expect(resolved.file).toBeInstanceOf(File);
+        expect(resolved.id).toBe('12345');
+        expect(resolved.album.id).toBe('album-1');
+    });
+
+    test('can match a downloaded local file by normalized metadata when ids are absent', () => {
+        player = new Player(audioElement, api);
+
+        window.localFilesCache = [
+            {
+                id: 'local-two',
+                title: 'Beyonce Song',
+                artist: { name: 'Beyonce' },
+                artists: [{ name: 'Beyonce' }],
+                album: { title: 'Renaissance' },
+                duration: 241,
+                isLocal: true,
+                file: new File(['audio'], 'beyonce-song.flac', { type: 'audio/flac' }),
+                localSource: {},
+            },
+        ];
+
+        const resolved = player.applyLocalPlaybackOverride({
+            id: 'api-two',
+            title: 'Beyoncé Song',
+            artist: { name: 'Beyonce' },
+            artists: [{ name: 'Beyonce' }],
+            album: { title: 'Renaissance' },
+            duration: 242,
+        });
+
+        expect(resolved.isLocal).toBe(true);
+        expect(resolved.file).toBeInstanceOf(File);
     });
 });

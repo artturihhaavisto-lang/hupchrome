@@ -43,7 +43,6 @@ import {
     fullscreenCoverTiltDistanceSettings,
     fullscreenCoverTiltSpeedSettings,
     devModeSettings,
-    serverDisruptionSettings,
 } from './storage.js';
 import { audioContextManager, getPresetsForBandCount } from './audio-context.js';
 import { calculateBiquadResponse, interpolate, getNormalizationOffset, runAutoEqAlgorithm } from './autoeq-engine.js';
@@ -52,6 +51,7 @@ import { fetchAutoEqIndex, fetchHeadphoneData, searchHeadphones, POPULAR_HEADPHO
 import { db } from './db.js';
 import { authManager } from './accounts/auth.js';
 import { syncManager } from './accounts/pocketbase.js';
+import { cloudflareSyncManager } from './accounts/cloudflare.js';
 import { containerFormats, customFormats } from './ffmpegFormats.ts';
 import { BulkDownloadMethod, modernSettings } from './ModernSettings.js';
 
@@ -77,7 +77,7 @@ export async function initializeSettings(scrobbler, player, api, ui) {
     }
 
     // Initialize account system UI & Settings
-    authManager.updateUI(authManager.user);
+    cloudflareSyncManager.updateUI();
 
     // ========================================
     // Dev Mode
@@ -107,23 +107,6 @@ export async function initializeSettings(scrobbler, player, api, ui) {
         });
     }
 
-    // ========================================
-    // Server Disruption Banner
-    // ========================================
-    const disruptionBanner = document.getElementById('server-disruption-banner');
-    const dismissDisruptionBtn = document.getElementById('dismiss-disruption-btn');
-
-    if (disruptionBanner && !serverDisruptionSettings.isDismissed()) {
-        disruptionBanner.style.display = 'flex';
-    }
-
-    if (dismissDisruptionBtn) {
-        dismissDisruptionBtn.addEventListener('click', () => {
-            serverDisruptionSettings.dismiss();
-            if (disruptionBanner) disruptionBanner.style.display = 'none';
-        });
-    }
-
     // Email Auth UI Logic
     const toggleEmailBtn = document.getElementById('toggle-email-auth-btn');
     const authModalCloseBtn = document.getElementById('email-auth-modal-close');
@@ -133,11 +116,69 @@ export async function initializeSettings(scrobbler, player, api, ui) {
     const signInBtn = document.getElementById('email-signin-btn');
     const signUpBtn = document.getElementById('email-signup-btn');
     const resetPasswordBtn = document.getElementById('reset-password-btn');
+    const primaryCloudBtn = document.getElementById('auth-connect-btn');
+    const secondaryCloudBtn = document.getElementById('auth-github-btn');
+    const tertiaryCloudBtn = document.getElementById('auth-discord-btn');
+    const clearCloudBtn = document.getElementById('auth-clear-cloud-btn');
 
     if (toggleEmailBtn && authModal) {
         toggleEmailBtn.addEventListener('click', () => {
+            if (cloudflareSyncManager.isSignedIn && cloudflareSyncManager.recoveryKey) {
+                cloudflareSyncManager.updateUI();
+                return;
+            }
             authModal.classList.add('active');
         });
+    }
+
+    if (primaryCloudBtn) {
+        primaryCloudBtn.onclick = async () => {
+            if (cloudflareSyncManager.isSignedIn) {
+                cloudflareSyncManager.signOut();
+                return;
+            }
+
+            try {
+                const payload = await cloudflareSyncManager.createAccount();
+                cloudflareSyncManager.updateUI(payload);
+                alert(`Account created. Save this recovery key: ${payload.recoveryKey}`);
+            } catch (error) {
+                alert(error.message || 'Failed to create cloud sync account');
+            }
+        };
+    }
+
+    if (secondaryCloudBtn) {
+        secondaryCloudBtn.onclick = async () => {
+            if (cloudflareSyncManager.isSignedIn) {
+                try {
+                    await cloudflareSyncManager.pushPlaylists();
+                    alert('Playlists synced to cloud.');
+                } catch (error) {
+                    alert(error.message || 'Failed to sync playlists');
+                }
+                return;
+            }
+
+            authModal?.classList.add('active');
+        };
+    }
+
+    if (tertiaryCloudBtn) {
+        tertiaryCloudBtn.onclick = async () => {
+            if (cloudflareSyncManager.isSignedIn) {
+                const recoveryKey = cloudflareSyncManager.recoveryKey;
+                if (!recoveryKey) {
+                    alert('No recovery key stored on this device.');
+                    return;
+                }
+                await navigator.clipboard.writeText(recoveryKey);
+                alert('Recovery key copied.');
+                return;
+            }
+
+            authModal?.classList.add('active');
+        };
     }
 
     if (authModal) {
@@ -148,55 +189,75 @@ export async function initializeSettings(scrobbler, player, api, ui) {
 
     if (signInBtn) {
         signInBtn.addEventListener('click', async () => {
-            const email = emailInput.value;
-            const password = passwordInput.value;
-            if (!email || !password) {
-                alert('Please enter both email and password.');
+            const usernameOrAccountId = emailInput.value.trim();
+            const passwordOrRecoveryKey = passwordInput.value.trim();
+            if (!usernameOrAccountId || !passwordOrRecoveryKey) {
+                alert('Please enter both fields.');
                 return;
             }
             try {
-                await authManager.signInWithEmail(email, password);
+                if (usernameOrAccountId.startsWith('acct_')) {
+                    await cloudflareSyncManager.signIn(usernameOrAccountId, passwordOrRecoveryKey);
+                } else {
+                    await cloudflareSyncManager.signInWithUsername(usernameOrAccountId, passwordOrRecoveryKey);
+                }
                 authModal.classList.remove('active');
                 emailInput.value = '';
                 passwordInput.value = '';
-            } catch {
-                // Error handled in authManager
+                cloudflareSyncManager.updateUI();
+            } catch (error) {
+                alert(error.message || 'Failed to sign in to cloud sync');
             }
         });
     }
 
     if (signUpBtn) {
         signUpBtn.addEventListener('click', async () => {
-            const email = emailInput.value;
-            const password = passwordInput.value;
-            if (!email || !password) {
-                alert('Please enter both email and password.');
+            const username = emailInput.value.trim();
+            const password = passwordInput.value.trim();
+            if (!username || !password) {
+                alert('Please enter both username and password.');
                 return;
             }
             try {
-                await authManager.signUpWithEmail(email, password);
+                await cloudflareSyncManager.register(username, password);
                 authModal.classList.remove('active');
                 emailInput.value = '';
                 passwordInput.value = '';
-            } catch {
-                // Error handled in authManager
+                cloudflareSyncManager.updateUI();
+            } catch (error) {
+                alert(error.message || 'Failed to register cloud sync account');
             }
         });
     }
 
     if (resetPasswordBtn) {
         resetPasswordBtn.addEventListener('click', async () => {
-            const email = emailInput.value;
-            if (!email) {
-                alert('Please enter your email address to reset your password.');
-                return;
-            }
             try {
-                await authManager.sendPasswordReset(email);
-            } catch {
-                /* ignore */
+                const payload = await cloudflareSyncManager.createAccount();
+                cloudflareSyncManager.updateUI(payload);
+                authModal.classList.remove('active');
+                emailInput.value = '';
+                passwordInput.value = '';
+                alert(`Account created. Save this recovery key: ${payload.recoveryKey}`);
+            } catch (error) {
+                alert(error.message || 'Failed to create cloud sync account');
             }
         });
+    }
+
+    if (clearCloudBtn) {
+        clearCloudBtn.onclick = async () => {
+            if (!cloudflareSyncManager.isSignedIn) return;
+            if (!confirm('Clear all synced playlists from cloud storage?')) return;
+
+            try {
+                await cloudflareSyncManager.clearCloudData();
+                alert('Cloud playlists cleared.');
+            } catch (error) {
+                alert(error.message || 'Failed to clear cloud playlists');
+            }
+        };
     }
 
     const lastfmConnectBtn = document.getElementById('lastfm-connect-btn');

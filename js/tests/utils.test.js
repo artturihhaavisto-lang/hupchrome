@@ -143,6 +143,23 @@ describe('utils.js', () => {
             expect(html).toContain('HD');
             expect(html).toContain('YT');
         });
+
+        test('shows detected local file format for local tracks', () => {
+            const flacHtml = utils.createQualityBadgeHTML({
+                isLocal: true,
+                localFileFormat: 'flac',
+                audioQuality: 'LOSSLESS',
+            });
+            const m4aHtml = utils.createQualityBadgeHTML({
+                isLocal: true,
+                localFileFormat: 'm4a',
+                audioQuality: 'HIGH',
+            });
+
+            expect(flacHtml).toContain('FLAC');
+            expect(m4aHtml).toContain('AAC');
+            expect(m4aHtml).not.toContain('Lossless');
+        });
     });
 
     describe('getTrackTitle', () => {

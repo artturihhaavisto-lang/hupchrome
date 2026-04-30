@@ -104,6 +104,116 @@ export class Player {
         }
     }
 
+    normalizeLocalMatchValue(value) {
+        return String(value || '')
+            .toLowerCase()
+            .normalize('NFKD')
+            .replace(/[\u0300-\u036f]/g, '')
+            .replace(/[^\p{L}\p{N}]/gu, '');
+    }
+
+    pickBetterLocalMatch(currentMatch, candidate) {
+        if (!currentMatch) return candidate;
+
+        const currentHasTrackId = !!currentMatch.localSource?.trackId;
+        const candidateHasTrackId = !!candidate.localSource?.trackId;
+        if (candidateHasTrackId !== currentHasTrackId) {
+            return candidateHasTrackId ? candidate : currentMatch;
+        }
+
+        const currentDuration = Number(currentMatch.duration || 0);
+        const candidateDuration = Number(candidate.duration || 0);
+        if (candidateDuration !== currentDuration) {
+            return candidateDuration > currentDuration ? candidate : currentMatch;
+        }
+
+        const currentCover = currentMatch.album?.cover && currentMatch.album.cover !== 'assets/appicon.png';
+        const candidateCover = candidate.album?.cover && candidate.album.cover !== 'assets/appicon.png';
+        if (candidateCover !== currentCover) {
+            return candidateCover ? candidate : currentMatch;
+        }
+
+        return currentMatch;
+    }
+
+    findMatchingLocalTrack(track) {
+        if (!track || track.isLocal) return track;
+
+        const localTracks = Array.isArray(window.localFilesCache) ? window.localFilesCache : [];
+        if (localTracks.length === 0) return null;
+
+        const targetTrackId = String(track.id || '');
+        const targetIsrc = String(track.isrc || '').trim().toUpperCase();
+        const targetTitle = this.normalizeLocalMatchValue(track.title);
+        const targetArtist = this.normalizeLocalMatchValue(track.artist?.name || track.artists?.[0]?.name);
+        const targetAlbum = this.normalizeLocalMatchValue(track.album?.title);
+        const targetDuration = Number(track.duration || 0);
+
+        let bestMatch = null;
+
+        for (const localTrack of localTracks) {
+            if (!localTrack?.file) continue;
+
+            const localTrackId = String(localTrack.localSource?.trackId || '');
+            if (localTrackId && targetTrackId && localTrackId === targetTrackId) {
+                bestMatch = this.pickBetterLocalMatch(bestMatch, localTrack);
+                continue;
+            }
+
+            const localIsrc = String(localTrack.isrc || '').trim().toUpperCase();
+            if (targetIsrc && localIsrc && targetIsrc === localIsrc) {
+                bestMatch = this.pickBetterLocalMatch(bestMatch, localTrack);
+                continue;
+            }
+
+            const localTitle = this.normalizeLocalMatchValue(localTrack.title);
+            const localArtist = this.normalizeLocalMatchValue(localTrack.artist?.name || localTrack.artists?.[0]?.name);
+            const localAlbum = this.normalizeLocalMatchValue(localTrack.album?.title);
+            const localDuration = Number(localTrack.duration || 0);
+            const durationDelta = targetDuration > 0 && localDuration > 0 ? Math.abs(targetDuration - localDuration) : 0;
+
+            if (
+                targetTitle &&
+                targetArtist &&
+                localTitle === targetTitle &&
+                localArtist === targetArtist &&
+                (!targetAlbum || !localAlbum || localAlbum === targetAlbum) &&
+                durationDelta <= 2
+            ) {
+                bestMatch = this.pickBetterLocalMatch(bestMatch, localTrack);
+            }
+        }
+
+        return bestMatch;
+    }
+
+    applyLocalPlaybackOverride(track) {
+        const localTrack = this.findMatchingLocalTrack(track);
+        if (!localTrack || !localTrack.file) return track;
+
+        return {
+            ...track,
+            ...localTrack,
+            id: track.id,
+            title: localTrack.title || track.title,
+            artist: localTrack.artist || track.artist,
+            artists: localTrack.artists?.length ? localTrack.artists : track.artists,
+            album: {
+                ...(track.album || {}),
+                ...(localTrack.album || {}),
+                id: track.album?.id || localTrack.album?.id,
+                title: localTrack.album?.title || track.album?.title,
+                releaseDate: track.album?.releaseDate || localTrack.album?.releaseDate,
+                artist: track.album?.artist || localTrack.album?.artist,
+            },
+            duration: localTrack.duration || track.duration,
+            isLocal: true,
+            file: localTrack.file,
+            localSource: localTrack.localSource || null,
+            originalTrackId: track.id,
+        };
+    }
+
     static async initialize(audioElement, api, quality) {
         if (Player.#instance) {
             throw new Error('Player is already initialized');
@@ -552,7 +662,9 @@ export class Player {
         const titleEl = document.querySelector('.now-playing-bar .title');
         if (!titleEl) return;
 
-        titleEl.innerHTML = `<span class="now-playing-title-text">${escapeHtml(getTrackTitle(track))}</span>${createQualityBadgeHTML(track)}${this.createStreamQualityBadgeHTML(track)}`;
+        const streamQualityBadge = this.createStreamQualityBadgeHTML(track);
+        const baseQualityBadge = streamQualityBadge ? '' : createQualityBadgeHTML(track);
+        titleEl.innerHTML = `<span class="now-playing-title-text">${escapeHtml(getTrackTitle(track))}</span>${baseQualityBadge}${streamQualityBadge}`;
     }
 
     resolvePlaybackProviderLabel(track, streamInfo = track?.streamInfo || track?.currentStreamInfo) {
@@ -595,8 +707,8 @@ export class Player {
         if (!streamInfo) return '';
 
         const parts = [];
-        const format = this.formatStreamToken(streamInfo.format || this.inferFormatFromUrl(streamInfo.url));
-        const quality = this.formatStreamQuality(streamInfo.quality || streamInfo.audioQuality);
+        const format = this.resolveStreamFormat(streamInfo);
+        const quality = this.formatStreamQuality(streamInfo.quality || streamInfo.audioQuality, format);
         const sampleRate = this.formatSampleRate(streamInfo.sampleRate || streamInfo.sampleRateHz, streamInfo.quality);
         const bitrate = this.formatBitrate(
             streamInfo.bitrate || streamInfo.bitrateKbps || streamInfo.estimatedBitrateKbps
@@ -620,16 +732,21 @@ export class Player {
         if (!token) return '';
         const normalized = token.toLowerCase();
         if (normalized === 'flac') return 'FLAC';
+        if (normalized === 'alac') return 'ALAC';
         if (normalized === 'aac' || normalized === 'm4a' || normalized === 'mp4a') return 'AAC';
         if (normalized === 'mp3') return 'MP3';
         if (normalized === 'opus') return 'Opus';
         return token.toUpperCase();
     }
 
-    formatStreamQuality(value) {
+    formatStreamQuality(value, resolvedFormat = '') {
         const token = String(value || '').trim();
         if (!token) return '';
         const normalized = token.toLowerCase().replace(/[_-]+/g, ' ');
+        const lossyFormats = new Set(['AAC', 'MP3', 'OPUS']);
+        if ((normalized.includes('lossless') || normalized.includes('hires') || normalized.includes('hi res')) && lossyFormats.has(resolvedFormat)) {
+            return '';
+        }
         if (normalized.includes('hires') || normalized.includes('hi res')) return 'Hi-Res';
         if (normalized.includes('lossless')) return 'Lossless';
         if (normalized.includes('high')) return 'High';
@@ -660,6 +777,26 @@ export class Player {
         if (cleanUrl.endsWith('.mp3')) return 'mp3';
         if (cleanUrl.endsWith('.m4a') || cleanUrl.endsWith('.mp4') || cleanUrl.includes('tidal')) return 'aac';
         return '';
+    }
+
+    inferFormatFromContentType(contentType) {
+        const normalized = String(contentType || '').toLowerCase();
+        if (!normalized) return '';
+        if (normalized.includes('flac')) return 'flac';
+        if (normalized.includes('mpeg')) return 'mp3';
+        if (normalized.includes('ogg') || normalized.includes('opus')) return 'opus';
+        if (normalized.includes('mp4') || normalized.includes('aac')) return 'aac';
+        return '';
+    }
+
+    resolveStreamFormat(streamInfo) {
+        const format =
+            streamInfo?.codec ||
+            streamInfo?.audioCodec ||
+            streamInfo?.format ||
+            this.inferFormatFromContentType(streamInfo?.contentType) ||
+            this.inferFormatFromUrl(streamInfo?.url);
+        return this.formatStreamToken(format);
     }
 
     attachStreamInfoToTrack(track, streamInfo, currentSequence) {
@@ -1487,7 +1624,9 @@ export class Player {
             return;
         }
 
-        const track = currentQueue[this.currentQueueIndex];
+        const queueTrack = currentQueue[this.currentQueueIndex];
+        const track = this.applyLocalPlaybackOverride(queueTrack);
+        currentQueue[this.currentQueueIndex] = track;
         if (track.isUnavailable) {
             this.hidePlaybackLoadProgress();
             console.warn(`Attempted to play unavailable track: ${track.title}. Skipping...`);

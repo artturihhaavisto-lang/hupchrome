@@ -826,6 +826,42 @@ export class MusicDatabase {
         });
     }
 
+    async replacePlaylists(playlists = []) {
+        const db = await this.open();
+        return new Promise((resolve, reject) => {
+            const transaction = db.transaction('user_playlists', 'readwrite');
+            const store = transaction.objectStore('user_playlists');
+
+            store.clear();
+
+            for (const rawPlaylist of playlists) {
+                if (!rawPlaylist || !rawPlaylist.id) continue;
+
+                const playlist = {
+                    id: rawPlaylist.id,
+                    name: rawPlaylist.name || rawPlaylist.title || 'Untitled Playlist',
+                    tracks: Array.isArray(rawPlaylist.tracks) ? rawPlaylist.tracks : [],
+                    cover: rawPlaylist.cover || null,
+                    description: rawPlaylist.description || '',
+                    createdAt: rawPlaylist.createdAt || Date.now(),
+                    updatedAt: rawPlaylist.updatedAt || Date.now(),
+                    numberOfTracks: rawPlaylist.numberOfTracks || 0,
+                    images: Array.isArray(rawPlaylist.images) ? rawPlaylist.images : [],
+                    isPublic: !!rawPlaylist.isPublic,
+                };
+
+                this._updatePlaylistMetadata(playlist);
+                store.put(playlist);
+            }
+
+            transaction.oncomplete = () => {
+                window.dispatchEvent(new CustomEvent('playlist-tracks-changed'));
+                resolve(true);
+            };
+            transaction.onerror = (event) => reject(event.target.error);
+        });
+    }
+
     async updatePlaylistName(playlistId, newName) {
         const playlist = await this.performTransaction('user_playlists', 'readonly', (store) => store.get(playlistId));
         if (!playlist) throw new Error('Playlist not found');

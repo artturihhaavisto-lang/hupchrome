@@ -79,6 +79,18 @@ describe('LosslessAPI YouTube fallback', () => {
         expect(track.duration).toBe(224);
     });
 
+    test('normalizes ISO 8601 track durations', () => {
+        const track = api.prepareTrack({
+            id: 123,
+            title: 'Digital Love',
+            type: 'track',
+            duration: 'PT4M58S',
+            artist: { id: 1, name: 'Daft Punk' },
+        });
+
+        expect(track.duration).toBe(298);
+    });
+
     test('searches YouTube Music when selected as the music source', async () => {
         musicSourceSettings.setSource('youtube-music');
         api.getYouTubeFallbackInstances = vi.fn().mockResolvedValue(['https://invidious.example']);

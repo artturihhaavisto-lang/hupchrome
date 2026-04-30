@@ -292,10 +292,17 @@ export const createQualityBadgeHTML = (track) => {
     if (!qualityBadgeSettings.isEnabled()) return '';
 
     const badges = [];
+    const localFormat = getLocalQualityBadge(track);
+    if (localFormat) {
+        badges.push(
+            `<span class="quality-badge stream-quality-badge" title="${escapeHtml(localFormat.title)}">${escapeHtml(localFormat.label)}</span>`
+        );
+    }
+
     const quality = deriveTrackQuality(track);
-    if (quality === 'DOLBY_ATMOS') {
+    if (!localFormat && quality === 'DOLBY_ATMOS') {
         badges.push(`<span class="quality-badge quality-atmos" title="Dolby Atmos">${SVG_ATMOS(20)}</span>`);
-    } else if (quality === 'HI_RES_LOSSLESS') {
+    } else if (!localFormat && quality === 'HI_RES_LOSSLESS') {
         badges.push('<span class="quality-badge quality-hires" title="Hi-Res Lossless">HD</span>');
     }
 
@@ -304,6 +311,27 @@ export const createQualityBadgeHTML = (track) => {
     }
 
     return badges.join('');
+};
+
+export const getLocalQualityBadge = (track) => {
+    if (!track?.isLocal) return null;
+
+    const format = String(track.localFileFormat || '').toLowerCase();
+    switch (format) {
+        case 'flac':
+            return { label: 'FLAC', title: 'Local FLAC lossless file' };
+        case 'm4a':
+        case 'mp4':
+            return { label: 'AAC', title: 'Local AAC/MP4 audio file' };
+        case 'mp3':
+            return { label: 'MP3', title: 'Local MP3 audio file' };
+        case 'ogg':
+            return { label: 'OGG', title: 'Local Ogg audio file' };
+        case 'wav':
+            return { label: 'WAV', title: 'Local WAV audio file' };
+        default:
+            return null;
+    }
 };
 
 export const deriveQualityFromTags = (rawTags) => {

@@ -1002,11 +1002,11 @@
             </div>
         </div>
 
-        <div id="email-auth-modal" class="modal">
+                <div id="email-auth-modal" class="modal">
             <div class="modal-overlay"></div>
             <div class="modal-content email-auth-modal-content">
                 <div class="email-auth-modal-header">
-                    <h3>Email Authentication</h3>
+                    <h3>Cloud Sync Account</h3>
                     <button
                         type="button"
                         class="btn-icon email-auth-modal-close"
@@ -1017,25 +1017,25 @@
                     </button>
                 </div>
                 <input
-                    type="email"
+                    type="text"
                     id="auth-email"
                     class="template-input email-auth-input"
-                    placeholder="Email Address"
+                    placeholder="Username or account ID"
                 />
                 <div class="email-auth-password-block">
                     <input
                         type="password"
                         id="auth-password"
                         class="template-input email-auth-input"
-                        placeholder="Password"
+                        placeholder="Password or recovery key"
                     />
                     <button type="button" id="reset-password-btn" class="email-auth-forgot-link">
-                        Forgot password?
+                        Create anonymous account
                     </button>
                 </div>
                 <div class="email-auth-actions">
                     <button type="button" id="email-signin-btn" class="btn-primary email-auth-submit">Sign In</button>
-                    <button type="button" id="email-signup-btn" class="btn-secondary email-auth-submit">Sign Up</button>
+                    <button type="button" id="email-signup-btn" class="btn-secondary email-auth-submit">Register</button>
                 </div>
             </div>
         </div>
@@ -1733,19 +1733,6 @@
                         </nav>
 
                         <div class="sidebar-nav-bottom">
-                            <div id="server-disruption-banner" class="server-disruption-sidebar" style="display: none">
-                                <span class="disruption-icon">&#9888;</span>
-                                <span
-                                    >Services are currently unstable. <br /><br />Use the extension
-                                    <a href="https://github.com/monochrome-music/monochrome/tree/main/extension"
-                                        >here</a
-                                    >
-                                    for the best experience.</span
-                                >
-                                <button id="dismiss-disruption-btn" class="disruption-dismiss" title="Dismiss">
-                                    &times;
-                                </button>
-                            </div>
                             <nav class="sidebar-nav bottom">
                                 <ul>
                                     <li class="nav-item" id="sidebar-nav-about-bottom">
@@ -5914,10 +5901,10 @@
                     </div>
                 </div>
                 <div id="page-account" class="page">
-                    <h2 class="section-title" style="text-align: center">Sign Up / Sign In</h2>
+                    <h2 class="section-title" style="text-align: center">Cloud Sync</h2>
                     <div class="account-content">
-                        <p style="text-align: center" class="account-description">
-                            Make an account to allow syncing your library between devices.
+                        <p id="auth-helper-text" style="text-align: center" class="account-description">
+                            Create a cloud sync account or sign in with a username to sync playlists between devices.
                         </p>
                         <div
                             class="account-buttons"
@@ -5931,28 +5918,43 @@
                                 flex-wrap: wrap;
                             "
                         >
-                            <button id="auth-connect-btn" class="btn-secondary">Connect with Google</button>
-                            <button id="auth-github-btn" class="btn-secondary">Connect with GitHub</button>
-                            <button id="auth-discord-btn" class="btn-secondary">Connect with Discord</button>
-                            <button id="toggle-email-auth-btn" class="btn-secondary">Connect with Email</button>
+                            <button id="auth-connect-btn" class="btn-secondary">Create Account</button>
+                            <button id="auth-github-btn" class="btn-secondary">Sign In</button>
+                            <button id="auth-discord-btn" class="btn-secondary">Register Username</button>
+                            <button id="toggle-email-auth-btn" class="btn-secondary">Username / Password</button>
                             <button id="view-my-profile-btn" class="btn-secondary" style="display: none">
                                 View My Profile
                             </button>
                         </div>
 
                         <p id="auth-status" style="text-align: center; padding-top: 15px; color: #8b8b93">
-                            Sync your library across devices
+                            Sign in to sync playlists between devices
                         </p>
-                        <p style="padding-top: 50px; text-align: center; color: #8b8b93">
-                            We only store music data and a randomized ID to find out which Google/Email account is
-                            which.
-                            <br />
-                            All data is anonymous. We do not store anything like emails, usernames, or anything
-                            sensitive. <br />
-                        </p>
-                        <p style="padding-top: 50px; text-align: center; color: #8b8b93">
-                            However, if you want complete control over your data, we allow you to use your own Database
-                            Configuration.
+                        <div
+                            id="cloud-sync-recovery"
+                            style="
+                                display: none;
+                                max-width: 620px;
+                                margin: 24px auto 0;
+                                padding: 14px 16px;
+                                border: 1px solid var(--border);
+                                border-radius: var(--radius-md);
+                                background: var(--card);
+                                color: var(--foreground);
+                                text-align: center;
+                            "
+                        >
+                            <div style="font-size: 0.8rem; color: var(--muted-foreground); margin-bottom: 8px">
+                                Recovery key
+                            </div>
+                            <code
+                                id="cloud-sync-recovery-value"
+                                style="display: block; word-break: break-all; user-select: all"
+                            ></code>
+                        </div>
+                        <p id="auth-privacy-text" style="padding-top: 50px; text-align: center; color: #8b8b93">
+                            This sync account is separate from the rest of the site. It only handles playlist saving
+                            and loading.
                         </p>
                         <div
                             style="
@@ -5964,7 +5966,7 @@
                             "
                         >
                             <a id="advanced-config-link" class="btn-secondary" href="/settings"
-                                >Advanced: Custom Configuration</a
+                                >Advanced: Cloud Sync Endpoint</a
                             >
                         </div>
                     </div>

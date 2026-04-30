@@ -11,9 +11,12 @@ import {
     escapeHtml,
     getTrackDiscNumber,
 } from './utils.js';
-import { lyricsSettings, playlistSettings } from './storage.js';
+import { lyricsSettings, playlistSettings, downloadQualitySettings } from './storage.js';
 import { generateM3U, generateM3U8, generateCUE, generateNFO, generateJSON } from './playlist-generator.js';
 import { ZipStreamWriter, ZipBlobWriter, FolderPickerWriter, SequentialFileWriter } from './bulk-download-writer.ts';
+import { DashDownloader } from './dash-downloader.ts';
+import { HlsDownloader } from './hls-downloader.js';
+import { applyAudioPostProcessing } from './download-utils.ts';
 import { FfmpegProgress } from './ffmpeg.types.js';
 import { DownloadProgress, ProgressMessage, SegmentedDownloadProgress } from './progressEvents.js';
 import { db } from './db.js';
@@ -21,6 +24,8 @@ import { BulkDownloadMethod, modernSettings } from './ModernSettings.js';
 import { SVG_CLOSE } from './icons.ts';
 import { MusicAPI } from './music-api.js';
 import { LyricsManager } from './lyrics.js';
+import { getProxyUrl } from './proxy-utils.js';
+import { readableStreamIterator } from './readableStreamIterator.js';
 
 const downloadTasks = new Map();
 const bulkDownloadTasks = new Map();
@@ -314,7 +319,144 @@ function removeBulkDownloadTask(notifEl) {
     }, 300);
 }
 
+function isCanonicalTidalTrackId(id) {
+    if (typeof id === 'number') return Number.isFinite(id);
+    if (typeof id !== 'string') return false;
+    if (/^t:\d+$/.test(id)) return true;
+    return /^\d+$/.test(id.trim());
+}
+
+function isLosslessQuality(quality) {
+    return typeof quality === 'string' && quality.toUpperCase().includes('LOSSLESS');
+}
+
+function isLosslessStreamInfo(streamInfo) {
+    if (!streamInfo) return false;
+    const url = String(streamInfo.url || streamInfo || '').toLowerCase();
+    const format = String(streamInfo.format || '').toLowerCase();
+    const quality = String(streamInfo.audioQuality || streamInfo.quality || '').toUpperCase();
+
+    return (
+        url.includes('.flac') ||
+        format.includes('flac') ||
+        quality.includes('LOSSLESS') ||
+        quality.includes('HIRES') ||
+        quality.includes('HI-RES')
+    );
+}
+
+async function getLosslessPlayableStreamInfo(track, api, signal = null) {
+    const tidalAPI = api?.tidalAPI || api;
+    if (typeof tidalAPI?.getManifestFallbackStreamInfo !== 'function') return null;
+
+    try {
+        const streamInfo = await tidalAPI.getManifestFallbackStreamInfo(track, {
+            download: true,
+            signal,
+        });
+        return isLosslessStreamInfo(streamInfo) ? streamInfo : null;
+    } catch (error) {
+        if (error.name === 'AbortError') throw error;
+        return null;
+    }
+}
+
+async function downloadDirectStreamBlob(streamUrl, signal = null, onProgress = null) {
+    if (typeof streamUrl !== 'string' || !streamUrl) {
+        throw new Error('Could not resolve playable stream URL');
+    }
+
+    if (streamUrl.startsWith('blob:')) {
+        const downloader = new DashDownloader();
+        return downloader.downloadDashStream(streamUrl, {
+            signal,
+            onProgress,
+            calculateDashBytes: false,
+        });
+    }
+
+    if (streamUrl.includes('.m3u8') || streamUrl.includes('application/vnd.apple.mpegurl')) {
+        const downloader = new HlsDownloader();
+        return downloader.downloadHlsStream(streamUrl, {
+            signal,
+            onProgress,
+        });
+    }
+
+    const response = await fetch(getProxyUrl(streamUrl), {
+        cache: 'no-store',
+        signal,
+    });
+
+    if (!response.ok) {
+        throw new Error(`Fetch failed: ${response.status}`);
+    }
+
+    const totalBytes = parseInt(response.headers.get('Content-Length') || '', 10) || undefined;
+    if (!response.body) {
+        const blob = await response.blob();
+        onProgress?.(new DownloadProgress(blob.size, blob.size));
+        return blob;
+    }
+
+    const chunks = [];
+    let receivedBytes = 0;
+    for await (const chunk of readableStreamIterator(response.body)) {
+        chunks.push(chunk);
+        receivedBytes += chunk.byteLength;
+        onProgress?.(new DownloadProgress(receivedBytes, totalBytes));
+    }
+
+    return new Blob(chunks, {
+        type: response.headers.get('Content-Type') || 'application/octet-stream',
+    });
+}
+
+async function downloadPlayableTrackBlob(track, quality, api, signal = null, onProgress = null) {
+    let streamInfo =
+        isLosslessQuality(quality) && !track.audioUrl && !track.remoteUrl
+            ? await getLosslessPlayableStreamInfo(track, api, signal)
+            : null;
+
+    if (!streamInfo) {
+        streamInfo =
+            track.audioUrl || track.remoteUrl
+                ? { url: track.audioUrl || track.remoteUrl, audioQuality: track.audioQuality || null }
+                : await api.getPlayableStreamInfo(track, quality, {
+                      download: true,
+                      signal,
+                  });
+    }
+
+    let blob = await downloadDirectStreamBlob(streamInfo?.url || streamInfo, signal, onProgress);
+    blob = await applyAudioPostProcessing(
+        blob,
+        quality,
+        onProgress,
+        signal,
+        streamInfo?.audioQuality || streamInfo?.quality || null
+    );
+
+    try {
+        const { prefetchMetadataObjects, addMetadataToAudio } = await import('./metadata.js');
+        const prefetchPromises = prefetchMetadataObjects(track, api);
+        blob = await addMetadataToAudio(blob, track, api, quality, prefetchPromises);
+    } catch (error) {
+        console.warn('Could not add metadata to direct stream download:', error);
+    }
+
+    const extension = await getExtensionFromBlob(blob);
+    return { blob, extension };
+}
+
 async function downloadTrackBlob(track, quality, api, signal = null, onProgress = null) {
+    const shouldUsePlayableResolver =
+        track?.audioUrl || track?.remoteUrl || !isCanonicalTidalTrackId(track?.id);
+
+    if (shouldUsePlayableResolver && typeof api.getPlayableStreamInfo === 'function') {
+        return downloadPlayableTrackBlob(track, quality, api, signal, onProgress);
+    }
+
     const blob = await api.downloadTrack(track.id, quality, undefined, {
         track,
         signal,
@@ -343,6 +485,8 @@ async function bulkDownload({
 }) {
     const { abortController } = bulkDownloadTasks.get(notification);
     const signal = abortController.signal;
+    let downloadedTrackCount = 0;
+    let failedTrackCount = 0;
 
     async function* yieldFiles() {
         // Add cover if available and enabled
@@ -380,6 +524,7 @@ async function bulkDownload({
                 const discPath = separateByDisc ? `${getDiscFolderName(discNumber)}/${filename}` : filename;
 
                 trackPaths.push(discPath);
+                downloadedTrackCount += 1;
 
                 yield {
                     name: buildZipTrackPath(folderName, filename, separateByDisc, discNumber),
@@ -408,8 +553,13 @@ async function bulkDownload({
             } catch (err) {
                 if (err.name === 'AbortError') throw err;
                 console.error(`Failed to download track ${trackTitle}:`, err);
+                failedTrackCount += 1;
                 trackPaths.push(null);
             }
+        }
+
+        if (downloadedTrackCount === 0) {
+            throw new Error('All playlist tracks failed to download. No audio files were saved.');
         }
 
         if (playlistSettings.shouldGenerateNFO()) {
@@ -492,6 +642,7 @@ async function bulkDownload({
     }
 
     await writer.write(yieldFiles());
+    return { downloadedTrackCount, failedTrackCount };
 }
 
 /**
@@ -624,6 +775,29 @@ async function createBulkWriter(folderName) {
     return new ZipBlobWriter(`${folderName}.zip`);
 }
 
+async function createLocalMediaWriter() {
+    const hasFolderPicker = 'showDirectoryPicker' in window;
+    if (!hasFolderPicker) {
+        throw new Error('Local media downloads require a browser with folder access support.');
+    }
+
+    const localHandle = await db.getSetting('local_folder_handle');
+    if (localHandle && typeof localHandle.requestPermission === 'function') {
+        try {
+            const permission = await localHandle.requestPermission({ mode: 'readwrite' });
+            if (permission === 'granted') {
+                return FolderPickerWriter.fromHandle(localHandle);
+            }
+        } catch {
+            // Fall through to picker.
+        }
+    }
+
+    const writer = await FolderPickerWriter.create();
+    await db.saveSetting('local_folder_handle', writer.getDirHandle());
+    return writer;
+}
+
 async function startBulkDownload({
     tracks,
     folderName = '',
@@ -635,31 +809,43 @@ async function startBulkDownload({
     coverBlob = null,
     metadata = null,
     single = false,
+    writer = null,
+    refreshLocalMedia = modernSettings.bulkDownloadMethod === BulkDownloadMethod.LocalMedia,
 }) {
     const notification = createBulkDownloadNotification(type, name, tracks.length);
 
     try {
-        const writer = single ? await createSingleTrackFolderWriter() : await createBulkWriter(folderName);
+        const resolvedWriter = writer || (single ? await createSingleTrackFolderWriter() : await createBulkWriter(folderName));
+        let result = null;
 
-        if (writer) {
-            await bulkDownload({
+        if (resolvedWriter) {
+            result = await bulkDownload({
                 tracks,
                 folderName,
                 api,
                 quality,
                 lyricsManager,
                 notification,
-                writer,
+                writer: resolvedWriter,
                 coverBlob,
                 type,
                 metadata,
             });
         }
 
-        completeBulkDownload(notification, true);
+        if (result?.failedTrackCount > 0) {
+            completeBulkDownload(
+                notification,
+                false,
+                result.downloadedTrackCount > 0
+                    ? `Downloaded ${result.downloadedTrackCount} tracks, ${result.failedTrackCount} failed.`
+                    : 'No tracks downloaded.'
+            );
+        } else {
+            completeBulkDownload(notification, true);
+        }
 
-        // If the download went to the local media folder, refresh the local library.
-        if (modernSettings.bulkDownloadMethod === BulkDownloadMethod.LocalMedia) {
+        if (refreshLocalMedia) {
             window.refreshLocalMediaFolder?.();
         }
     } catch (error) {
@@ -730,6 +916,31 @@ export async function downloadPlaylist(playlist, tracks, api, quality, _lyricsMa
         coverBlob,
         metadata: playlist,
         api,
+    });
+}
+
+export async function downloadPlaylistToLocalMedia(playlist, tracks, api, _lyricsManager = null) {
+    const folderName = formatPathTemplate(modernSettings.folderTemplate, {
+        albumTitle: playlist.title,
+        albumArtist: 'Playlist',
+        year: new Date().getFullYear(),
+    });
+
+    const representativeTrack = tracks.find((t) => t.album?.cover);
+    const coverBlob = await getCoverBlob(api, representativeTrack?.album?.cover);
+    const writer = await createLocalMediaWriter();
+
+    await startBulkDownload({
+        tracks,
+        folderName,
+        quality: downloadQualitySettings.getQuality(),
+        type: 'playlist',
+        name: playlist.title,
+        coverBlob,
+        metadata: playlist,
+        api,
+        writer,
+        refreshLocalMedia: true,
     });
 }
 

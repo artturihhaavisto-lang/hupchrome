@@ -3232,26 +3232,6 @@ export const devModeSettings = {
     },
 };
 
-export const serverDisruptionSettings = {
-    STORAGE_KEY: 'server-disruption-dismissed',
-
-    isDismissed() {
-        try {
-            return localStorage.getItem(this.STORAGE_KEY) === 'true';
-        } catch {
-            return false;
-        }
-    },
-
-    dismiss() {
-        localStorage.setItem(this.STORAGE_KEY, 'true');
-    },
-
-    reset() {
-        localStorage.removeItem(this.STORAGE_KEY);
-    },
-};
-
 export const contentBlockingSettings = {
     BLOCKED_ARTISTS_KEY: 'blocked-artists',
     BLOCKED_TRACKS_KEY: 'blocked-tracks',

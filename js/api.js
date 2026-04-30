@@ -118,6 +118,16 @@ export class LosslessAPI {
         if (!trimmed) return 0;
         if (/^\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
 
+        const isoMatch = trimmed.match(
+            /^P(?:\d+Y)?(?:\d+M)?(?:\d+W)?(?:\d+D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i
+        );
+        if (isoMatch) {
+            const hours = Number(isoMatch[1] || 0);
+            const minutes = Number(isoMatch[2] || 0);
+            const seconds = Number(isoMatch[3] || 0);
+            return hours * 3600 + minutes * 60 + seconds;
+        }
+
         const parts = trimmed.split(':').map((part) => Number.parseInt(part, 10));
         if (parts.length < 2 || parts.some((part) => Number.isNaN(part))) return 0;
         return parts.reduce((total, part) => total * 60 + part, 0);
@@ -1442,17 +1452,40 @@ export class LosslessAPI {
         return this.buildSearchResponse(section);
     }
 
+    normalizeTidalEntityId(id) {
+        if (typeof id === 'number') return Number.isFinite(id) ? id : id;
+        if (typeof id !== 'string') return id;
+
+        const trimmed = id.trim();
+        if (!trimmed) return id;
+        if (/^\d+$/.test(trimmed)) return Number(trimmed);
+
+        const prefixedMatch = trimmed.match(/^(?:id|pid)-(\d+)$/i);
+        if (prefixedMatch) {
+            return Number(prefixedMatch[1]);
+        }
+
+        return id;
+    }
+
     prepareTrack(track) {
         let normalized = track;
+
+        const parsedDuration = this.parseDurationSeconds(
+            track.duration ?? track.durationSeconds ?? track.lengthSeconds ?? track.length
+        );
+        if (parsedDuration && parsedDuration !== track.duration) {
+            normalized = { ...normalized, duration: parsedDuration };
+        }
 
         if (track.type && typeof track.type === 'string') {
             const lowType = track.type.toLowerCase();
             if (lowType.includes('video')) {
-                normalized = { ...track, type: 'video' };
+                normalized = { ...normalized, type: 'video' };
             } else if (lowType.includes('track')) {
-                normalized = { ...track, type: 'track' };
+                normalized = { ...normalized, type: 'track' };
             } else {
-                normalized = { ...track, type: lowType };
+                normalized = { ...normalized, type: lowType };
             }
         }
 
@@ -1492,10 +1525,16 @@ export class LosslessAPI {
     }
 
     prepareArtist(artist) {
-        if (!artist.type && Array.isArray(artist.artistTypes) && artist.artistTypes.length > 0) {
-            return { ...artist, type: artist.artistTypes[0] };
+        let normalized = artist;
+        const normalizedId = this.normalizeTidalEntityId(artist?.id);
+        if (normalizedId !== artist?.id) {
+            normalized = { ...normalized, id: normalizedId };
         }
-        return artist;
+
+        if (!normalized.type && Array.isArray(normalized.artistTypes) && normalized.artistTypes.length > 0) {
+            return { ...normalized, type: normalized.artistTypes[0] };
+        }
+        return normalized;
     }
 
     async enrichTracksWithAlbumDates(tracks, maxRequests = 20) {
@@ -2322,13 +2361,14 @@ export class LosslessAPI {
     }
 
     async getArtist(artistId, options = {}) {
-        const cacheKey = options.lightweight ? `artist_${artistId}_light` : `artist_${artistId}`;
+        const normalizedArtistId = this.normalizeTidalEntityId(artistId);
+        const cacheKey = options.lightweight ? `artist_${normalizedArtistId}_light` : `artist_${normalizedArtistId}`;
         if (!options.skipCache) {
             const cached = await this.cache.get('artist', cacheKey);
             if (cached) return cached;
         }
 
-        const primaryResponse = await this.fetchWithRetry(`/artist/?id=${artistId}`);
+        const primaryResponse = await this.fetchWithRetry(`/artist/?id=${normalizedArtistId}`);
         const primaryJsonData = await primaryResponse.json();
 
         // Unwrap data property if it exists, then unwrap artist property if it exists
@@ -2383,13 +2423,20 @@ export class LosslessAPI {
             ].filter((id) => id != null);
             return candidateIds.some((id) => Number(id) === Number(artistId));
         };
+        const matchesResolvedArtistId = (item) => {
+            const candidateIds = [
+                item.artist?.id,
+                ...(Array.isArray(item.artists) ? item.artists.map((a) => a.id) : []),
+            ].filter((id) => id != null);
+            return candidateIds.some((id) => Number(this.normalizeTidalEntityId(id)) === Number(normalizedArtistId));
+        };
 
         if (!options.lightweight) {
             try {
                 const videoSearch = await this.searchVideos(artist.name);
                 if (videoSearch && videoSearch.items) {
                     for (const item of videoSearch.items) {
-                        if (matchesArtistId(item) && !videoMap.has(item.id)) {
+                        if (matchesResolvedArtistId(item) && !videoMap.has(item.id)) {
                             videoMap.set(item.id, item);
                         }
                     }
@@ -2399,7 +2446,7 @@ export class LosslessAPI {
             }
         }
 
-        const rawReleases = Array.from(albumMap.values()).filter(matchesArtistId);
+        const rawReleases = Array.from(albumMap.values()).filter(matchesResolvedArtistId);
         const allReleases = this.deduplicateAlbums(rawReleases).sort(
             (a, b) => new Date(b.releaseDate || 0) - new Date(a.releaseDate || 0)
         );
@@ -2408,7 +2455,7 @@ export class LosslessAPI {
         const albums = allReleases.filter((a) => !eps.includes(a));
 
         const topTracks = Array.from(trackMap.values())
-            .filter(matchesArtistId)
+            .filter(matchesResolvedArtistId)
             .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
             .slice(0, 15);
 

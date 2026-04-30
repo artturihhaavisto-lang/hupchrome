@@ -29,6 +29,7 @@ import { sidePanelManager } from './side-panel.js';
 import { db } from './db.js';
 import { showNotification } from './downloads.js';
 import { syncManager } from './accounts/pocketbase.js';
+import { cloudflareSyncManager } from './accounts/cloudflare.js';
 import { authManager } from './accounts/auth.js';
 import { registerSW } from 'virtual:pwa-register';
 import { openEditProfile } from './profile.js';
@@ -148,6 +149,11 @@ async function fetchcontributors() {
         con.appendChild(userDIV);
     }
 }
+
+cloudflareSyncManager.init().catch((error) => {
+    console.error('[Cloudflare Sync] Initialization failed:', error);
+});
+window.cloudflareSyncManager = cloudflareSyncManager;
 
 async function loadMetadataModule() {
     if (!metadataModule) {
@@ -1253,12 +1259,11 @@ document.addEventListener('DOMContentLoaded', async () => {
                     tracks = data.tracks;
                 }
 
-                const { downloadPlaylist } = await loadDownloadsModule();
-                await downloadPlaylist(
+                const { downloadPlaylistToLocalMedia } = await loadDownloadsModule();
+                await downloadPlaylistToLocalMedia(
                     playlist,
                     tracks,
                     MusicAPI.instance,
-                    downloadQualitySettings.getQuality(),
                     lyricsManager
                 );
             } catch (error) {
@@ -2743,91 +2748,62 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
 
         async function updateAccountDropdown() {
-            const user = authManager?.user;
             headerAccountDropdown.innerHTML = '';
 
-            if (!user) {
-                const iconBtnStyle =
-                    'background:none;border:none;cursor:pointer;padding:4px;border-radius:6px;display:flex;align-items:center;transition:opacity 0.15s';
+            if (!cloudflareSyncManager.isSignedIn) {
                 headerAccountDropdown.innerHTML = `
-                    <span style="font-size:0.75rem;color:var(--muted-foreground);padding:0.25rem 0.5rem">Connect with</span>
-                    <div style="display:flex;gap:0.5rem;padding:0.25rem 0.5rem;align-items:center">
-                        <button id="header-discord-auth" title="Discord" style="${iconBtnStyle}">${discordSvg}</button>
-                        <button id="header-google-auth" title="Google" style="${iconBtnStyle}">${googleSvg}</button>
-                        <button id="header-github-auth" title="GitHub" style="${iconBtnStyle}">${githubSvg}</button>
-                        <button id="header-spotify-auth" title="Spotify" style="${iconBtnStyle}">${spotifySvg}</button>
-                    </div>
-                    <hr style="border:none;border-top:1px solid var(--border);margin:0.25rem 0">
-                    <button class="btn-secondary" id="header-email-auth">Connect with Email</button>
+                    <span style="font-size:0.75rem;color:var(--muted-foreground);padding:0.25rem 0.5rem">Cloud Sync</span>
+                    <button class="btn-secondary" id="header-create-cloud-account">Create Account</button>
+                    <button class="btn-secondary" id="header-sign-in-cloud">Sign In / Register</button>
                 `;
-
-                for (const id of [
-                    'header-discord-auth',
-                    'header-google-auth',
-                    'header-github-auth',
-                    'header-spotify-auth',
-                ]) {
-                    const btn = document.getElementById(id);
-                    const svg = btn.querySelector('svg');
-                    svg.style.filter = 'brightness(0) invert(1)';
-                    svg.style.transition = 'filter 0.15s';
-                    btn.addEventListener('mouseenter', () => {
-                        svg.style.filter = 'brightness(0) invert(0.5)';
-                    });
-                    btn.addEventListener('mouseleave', () => {
-                        svg.style.filter = 'brightness(0) invert(1)';
-                    });
-                }
-
-                document.getElementById('header-google-auth').onclick = () => authManager.signInWithGoogle();
-                document.getElementById('header-github-auth').onclick = () => authManager.signInWithGitHub();
-                document.getElementById('header-discord-auth').onclick = () => authManager.signInWithDiscord();
-                document.getElementById('header-spotify-auth').onclick = () => authManager.signInWithSpotify();
-                document.getElementById('header-email-auth').onclick = () => {
+                document.getElementById('header-create-cloud-account').onclick = async () => {
+                    try {
+                        const payload = await cloudflareSyncManager.createAccount();
+                        cloudflareSyncManager.updateUI(payload);
+                        await updateAccountDropdown();
+                        alert(`Account created. Save this recovery key: ${payload.recoveryKey}`);
+                    } catch (error) {
+                        alert(error.message || 'Failed to create cloud sync account');
+                    }
+                };
+                document.getElementById('header-sign-in-cloud').onclick = () => {
                     document.getElementById('email-auth-modal').classList.add('active');
                     headerAccountDropdown.classList.remove('active');
                 };
             } else {
-                const data = await syncManager.getUserData();
-                const hasProfile = data && data.profile && data.profile.username;
-
-                if (hasProfile) {
-                    headerAccountDropdown.innerHTML = `
-                        <button class="btn-secondary" id="header-view-profile">My Profile</button>
-                        <button class="btn-secondary danger" id="header-sign-out">Sign Out</button>
-                    `;
-                    document.getElementById('header-view-profile').onclick = () => {
-                        navigate(`/user/@${data.profile.username}`);
-                        headerAccountDropdown.classList.remove('active');
-                    };
-                } else {
-                    headerAccountDropdown.innerHTML = `
-                        <button class="btn-primary" id="header-create-profile">Create Profile</button>
-                        <button class="btn-secondary danger" id="header-sign-out">Sign Out</button>
-                    `;
-                    document.getElementById('header-create-profile').onclick = async () => {
-                        openEditProfile().catch(console.error);
-                        headerAccountDropdown.classList.remove('active');
-                    };
-                }
-
-                document.getElementById('header-sign-out').onclick = () => authManager.signOut();
+                const identity = cloudflareSyncManager.username || cloudflareSyncManager.accountId;
+                headerAccountDropdown.innerHTML = `
+                    <span style="font-size:0.75rem;color:var(--muted-foreground);padding:0.25rem 0.5rem">${identity}</span>
+                    <button class="btn-secondary" id="header-open-cloud-account">Manage Cloud Sync</button>
+                    <button class="btn-secondary" id="header-copy-recovery">Copy Recovery Key</button>
+                    <button class="btn-secondary danger" id="header-sign-out">Sign Out</button>
+                `;
+                document.getElementById('header-open-cloud-account').onclick = () => {
+                    navigate('/account');
+                    headerAccountDropdown.classList.remove('active');
+                };
+                document.getElementById('header-copy-recovery').onclick = async () => {
+                    const recoveryKey = cloudflareSyncManager.recoveryKey;
+                    if (!recoveryKey) {
+                        alert('No recovery key stored on this device.');
+                        return;
+                    }
+                    await navigator.clipboard.writeText(recoveryKey);
+                    showNotification('Recovery key copied.');
+                };
+                document.getElementById('header-sign-out').onclick = async () => {
+                    cloudflareSyncManager.signOut();
+                    await updateAccountDropdown();
+                };
             }
         }
 
-        authManager.onAuthStateChanged(async (user) => {
-            if (user) {
-                const data = await syncManager.getUserData();
-                if (data && data.profile && data.profile.avatar_url) {
-                    headerAccountImg.src = data.profile.avatar_url + '&s=100';
-                    headerAccountImg.style.display = 'block';
-                    headerAccountIcon.style.display = 'none';
-                    return;
-                }
-            }
+        function updateHeaderAccountIcon() {
             headerAccountImg.style.display = 'none';
             headerAccountIcon.style.display = 'flex';
-        });
+        }
+
+        updateHeaderAccountIcon();
     }
 });
 
